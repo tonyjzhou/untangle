@@ -47,7 +47,7 @@ Or per-request from the UI sidebar (⚙️ LLM settings) — stored only in your
 - `POST /api/generate/stream` (SSE) same input → `status` / `delta` / `done` events, plan streams in live so Regenerate never sits silent
 - `POST /api/refine` `{idea, plan_markdown, instruction, docs?, docsPath?, apiKey?, baseUrl?, model?}` → `{markdown, goal, source}` (needs API key)
 - `POST /api/refine/stream` (SSE) same input → live-refines the plan from a follow-up prompt
-- `POST /api/docs/scan` `{path}` → `{path, files: [{name, chars}], total_files, total_chars, truncated}` (scans a server-local folder for `.md` / `.markdown` / `.txt`, skips `.git`, `.obsidian`, `node_modules`, etc.; capped at 50 files / 30k chars)
+- `POST /api/docs/scan` `{path, query?, model?}` → `{path, files: [{name, chars, score}], total_files, total_chars, truncated, batches, budget, query_ranked}` (scans a server-local folder for `.md` / `.markdown` / `.txt`, skips `.git`, `.obsidian`, `node_modules`, etc.; scans up to 5000 files in batches and grounds the plan in the most relevant slice within a model-sized context budget, default ~400k chars, larger for 200k/1M models)
 - `GET /api/plans` → list `{id, title, created, updated}`
 - `POST /api/plans` `{title, raw_idea, plan_markdown}` → saved plan
 - `GET /api/plans/<id>` → `{id, title, raw_idea, plan_markdown, ...}`

@@ -84,9 +84,70 @@ updated: {now}
 #    (works because the app runs locally via `make dev`).
 DOCS_ALLOWED_EXTS = {".md", ".markdown", ".txt"}
 DOCS_SKIP_DIRS = {".git", ".obsidian", ".trash", "node_modules", "__pycache__", ".venv", "venv", ".DS_Store"}
-DOCS_MAX_FILES = 50
-DOCS_MAX_CHARS_PER_FILE = 8000
-DOCS_MAX_TOTAL_CHARS = 30000
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        raw = os.environ.get(name)
+        return int(str(raw).strip()) if raw and str(raw).strip() else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Reference-docs budgets. Defaults are sized for modern 128k+ context models
+# (~4 chars/token): 400k chars ≈ 100k tokens, leaving headroom for the system
+# prompt + answer. Override with env vars; the total also auto-scales with the
+# requested model (see _docs_total_budget). Files on disk are *scanned* in
+# batches up to DOCS_MAX_FILES — every file is considered for relevance, and
+# only the most relevant slice that fits the budget is sent to the LLM.
+DOCS_MAX_FILES = _env_int("DOCS_MAX_FILES", 5000)
+DOCS_MAX_CHARS_PER_FILE = _env_int("DOCS_MAX_CHARS_PER_FILE", 20000)
+DOCS_SCAN_BATCH = _env_int("DOCS_SCAN_BATCH", 500)
+DOCS_ENV_TOTAL_CHARS = _env_int("DOCS_MAX_TOTAL_CHARS", 0)  # 0 = not set, use model default
+
+
+def _docs_total_budget(model: str = "") -> int:
+    """Context budget (chars) shared by uploads + vault for one request."""
+    if DOCS_ENV_TOTAL_CHARS > 0:
+        return DOCS_ENV_TOTAL_CHARS
+    m = (model or "").lower()
+    if any(k in m for k in ("2m", "1m", "1000k", "1.5m")):
+        return 900000
+    if "200k" in m:
+        return 600000
+    if "128k" in m:
+        return 400000
+    if "64k" in m:
+        return 200000
+    if "32k" in m:
+        return 100000
+    if any(k in m for k in ("8k", "4k", "gpt-3", "3.5")):
+        return 24000
+    return 400000
+
+
+_DOCS_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "from", "have", "has",
+    "are", "was", "were", "will", "would", "could", "should", "about",
+    "into", "your", "you", "our", "their", "they", "them", "then",
+    "than", "also", "just", "like", "get", "got", "make", "made",
+    "more", "most", "some", "such", "when", "what", "which", "who",
+    "how", "why", "not", "but", "all", "any", "can", "its",
+})
+
+
+def _doc_tokens(text: str) -> set:
+    words = re.findall(r"[a-z0-9]{3,}", (text or "").lower())
+    return {w for w in words if w not in _DOCS_STOPWORDS}
+
+
+def _relevance_score(query_tokens: set, rel_path: str, head: str) -> int:
+    """Keyword-overlap score: filename matches weigh 3x (cheap, bounded)."""
+    if not query_tokens:
+        return 0
+    name_hit = len(query_tokens & _doc_tokens(rel_path.replace("/", " ").replace("-", " ")))
+    head_hit = len(query_tokens & _doc_tokens(head))
+    return 3 * name_hit + head_hit
 
 
 def _is_allowed_doc(path: Path) -> bool:
@@ -95,8 +156,15 @@ def _is_allowed_doc(path: Path) -> bool:
     return not any(part in DOCS_SKIP_DIRS for part in path.parts)
 
 
-def read_docs_dir(dirpath: str) -> dict:
-    """Scan a server-local folder for readable docs. Capped + truncated."""
+def read_docs_dir(dirpath: str, query: str = "", budget=None, per_file_cap=None, max_files=None) -> dict:
+    """Scan a server-local folder for readable docs.
+
+    Every matching file (up to max_files) is *considered*: files are read in
+    batches, scored against `query`, and the most relevant slice fitting
+    `budget` chars is returned as `combined`. A 5000-file vault works — the
+    plan is grounded in the most relevant subset. `total_files` is how many
+    files were found; `files` is the included subset.
+    """
     base = Path(dirpath).expanduser()
     if not str(dirpath).strip():
         raise ValueError("No folder path given.")
@@ -104,62 +172,85 @@ def read_docs_dir(dirpath: str) -> dict:
         raise ValueError(f"Folder not found: {dirpath}")
     if not base.is_dir():
         raise ValueError(f"Not a folder: {dirpath}")
+    per_file = per_file_cap or DOCS_MAX_CHARS_PER_FILE
+    total_budget = budget or _docs_total_budget("")
+    cap_files = max_files or DOCS_MAX_FILES
     found = []
     for ext in ("*.md", "*.markdown", "*.txt"):
         found.extend(base.rglob(ext))
     found = sorted({p for p in found if p.is_file() and _is_allowed_doc(p)})
+    total_found = len(found)
+    capped = found[:cap_files]
+    discovery_capped = total_found > len(capped)
+    q_tokens = _doc_tokens(query) if query and query.strip() else set()
+    candidates = []
+    batch_size = max(1, DOCS_SCAN_BATCH)
+    for i in range(0, len(capped), batch_size):
+        for p in capped[i:i + batch_size]:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            cut = False
+            if len(text) > per_file:
+                text = text[:per_file] + "\n[…truncated…]"
+                cut = True
+            rel = str(p.relative_to(base))
+            score = _relevance_score(q_tokens, rel, text[:8000])
+            candidates.append({"name": rel, "text": text, "score": score, "cut": cut})
+    candidates.sort(key=lambda c: (-c["score"], c["name"]))
     files_out = []
     combined_parts = []
     total_chars = 0
-    truncated = False
-    for p in found[:DOCS_MAX_FILES]:
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:
-            continue
-        if not text:
-            continue
-        if len(text) > DOCS_MAX_CHARS_PER_FILE:
-            text = text[:DOCS_MAX_CHARS_PER_FILE] + "\n[…truncated…]"
-            truncated = True
-        rel = str(p.relative_to(base))
-        files_out.append({"name": rel, "chars": len(text)})
-        if total_chars + len(text) > DOCS_MAX_TOTAL_CHARS:
-            remaining = DOCS_MAX_TOTAL_CHARS - total_chars
+    truncated = discovery_capped or any(c["cut"] for c in candidates)
+    for c in candidates:
+        if total_chars + len(c["text"]) > total_budget:
+            remaining = total_budget - total_chars
             if remaining > 500:
-                combined_parts.append(f"--- {rel} ---\n{text[:remaining]}\n[…vault truncated at budget…]")
+                combined_parts.append(f"--- {c['name']} ---\n{c['text'][:remaining]}\n[…vault truncated at budget…]")
+                files_out.append({"name": c["name"], "chars": len(c["text"]), "score": c["score"]})
             truncated = True
-            total_chars = DOCS_MAX_TOTAL_CHARS
+            total_chars = total_budget
             break
-        combined_parts.append(f"--- {rel} ---\n{text}")
-        total_chars += len(text)
-    if len(found) > DOCS_MAX_FILES:
+        combined_parts.append(f"--- {c['name']} ---\n{c['text']}")
+        files_out.append({"name": c["name"], "chars": len(c["text"]), "score": c["score"]})
+        total_chars += len(c["text"])
+    if len(candidates) > len(files_out):
         truncated = True
+    batches = (len(capped) + batch_size - 1) // batch_size if capped else 0
     return {
         "path": str(base.resolve()),
         "files": files_out,
-        "total_files": len(files_out),
+        "total_files": total_found,
         "total_chars": total_chars,
         "truncated": truncated,
         "combined": "\n\n".join(combined_parts),
+        "batches": batches,
+        "budget": total_budget,
+        "query_ranked": bool(q_tokens),
     }
 
 
-def normalize_uploaded_docs(docs) -> list:
+def normalize_uploaded_docs(docs, budget=None, per_file_cap=None, max_files=None) -> list:
     """Validate + cap client-uploaded [{name, content}] payloads."""
+    total_budget = budget or _docs_total_budget("")
+    per_file = per_file_cap or DOCS_MAX_CHARS_PER_FILE
+    cap_files = max_files or DOCS_MAX_FILES
     clean = []
     total = 0
-    for d in (docs or [])[:DOCS_MAX_FILES]:
+    for d in (docs or [])[:cap_files]:
         if not isinstance(d, dict):
             continue
         name = str(d.get("name") or "untitled.md")[:120]
         content = str(d.get("content") or "").strip()
         if not content:
             continue
-        if len(content) > DOCS_MAX_CHARS_PER_FILE:
-            content = content[:DOCS_MAX_CHARS_PER_FILE] + "\n[…truncated…]"
-        if total + len(content) > DOCS_MAX_TOTAL_CHARS:
-            remaining = DOCS_MAX_TOTAL_CHARS - total
+        if len(content) > per_file:
+            content = content[:per_file] + "\n[…truncated…]"
+        if total + len(content) > total_budget:
+            remaining = total_budget - total
             if remaining > 500:
                 clean.append({"name": name, "content": content[:remaining] + "\n[…truncated at budget…]"})
             break
@@ -169,16 +260,34 @@ def normalize_uploaded_docs(docs) -> list:
 
 
 def get_docs_context(data: dict) -> tuple:
-    """Return (context_block, sources) from uploads and/or a server folder."""
-    uploaded = normalize_uploaded_docs(data.get("docs"))
+    """Return (context_block, sources, vault_error) from uploads and/or a server folder.
+
+    Uploads and vault share one model-sized budget; explicit uploads win.
+    """
+    model = ""
+    idea_q = ""
+    instr_q = ""
+    if isinstance(data, dict):
+        model = str(data.get("model") or "")
+        idea_q = str(data.get("idea") or "")
+        instr_q = str(data.get("instruction") or "")
+    budget = _docs_total_budget(model)
+    query = f"{idea_q}\n{instr_q}".strip()
+    uploaded = normalize_uploaded_docs(data.get("docs") if isinstance(data, dict) else None, budget=budget)
+    used = sum(len(d["content"]) for d in uploaded)
     docs_path = (data.get("docsPath") or data.get("docs_path") or "").strip() if isinstance(data, dict) else ""
     vault = None
     vault_error = None
+    vault_skipped = False
     if docs_path:
-        try:
-            vault = read_docs_dir(docs_path)
-        except Exception as e:
-            vault_error = str(e)
+        remaining = max(0, budget - used)
+        if remaining < 500 and uploaded:
+            vault_skipped = True
+        else:
+            try:
+                vault = read_docs_dir(docs_path, query=query, budget=remaining)
+            except Exception as e:
+                vault_error = str(e)
     parts = []
     sources = []
     for d in uploaded:
@@ -187,6 +296,8 @@ def get_docs_context(data: dict) -> tuple:
     if vault and vault["combined"]:
         parts.append(f"--- vault: {vault['path']} ---\n{vault['combined']}")
         sources.extend(f["name"] for f in vault["files"])
+    if vault_skipped:
+        parts.append(f"[vault '{docs_path}' skipped: uploaded docs already fill the ~{budget // 1000}k char context budget]")
     if vault_error:
         parts.append(f"[vault read failed for '{docs_path}': {vault_error}]")
     context = "\n\n".join(parts).strip()
@@ -616,13 +727,20 @@ def delete_plan(plan_id):
 
 @app.post("/api/docs/scan")
 def scan_docs():
-    """Scan a server-local folder (e.g. Obsidian vault) for readable docs."""
+    """Scan a server-local folder (e.g. Obsidian vault) for readable docs.
+
+    Accepts optional `query` (or `idea`) + `model` so the relevance ranking
+    and context budget match the upcoming generate call. `total_files` is all
+    files found; `files` is the subset that fits the budget.
+    """
     data = request.get_json(force=True, silent=True) or {}
     path = (data.get("path") or data.get("docsPath") or "").strip()
     if not path:
         return jsonify({"error": "Give a folder path to scan."}), 400
+    query = (data.get("query") or data.get("idea") or "").strip()
+    model = (data.get("model") or "").strip()
     try:
-        result = read_docs_dir(path)
+        result = read_docs_dir(path, query=query, budget=_docs_total_budget(model))
     except Exception as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({
@@ -631,6 +749,9 @@ def scan_docs():
         "total_files": result["total_files"],
         "total_chars": result["total_chars"],
         "truncated": result["truncated"],
+        "batches": result["batches"],
+        "budget": result["budget"],
+        "query_ranked": result["query_ranked"],
     })
 
 

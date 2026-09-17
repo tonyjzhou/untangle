@@ -8,8 +8,8 @@ let streamingActive = false;
 let attachedDocs = [];
 let vaultPath = "";
 let vaultFiles = [];
-const DOCS_PER_FILE_LIMIT = 8000;
-const DOCS_TOTAL_LIMIT = 30000;
+const DOCS_PER_FILE_LIMIT = 20000;
+const DOCS_TOTAL_LIMIT = 400000;
 
 const store = {
   get baseUrl() { return localStorage.getItem("planner.baseUrl") || ""; },
@@ -498,13 +498,13 @@ async function handleDocsFiles(input) {
       if (remaining > 500) {
         attachedDocs.push({name: f.name, content: text.slice(0, remaining) + "\n[…truncated at budget…]"});
       }
-      alert("Docs budget reached (30k chars) — extra content was truncated.");
+      alert(`Docs budget reached (~${Math.round(DOCS_TOTAL_LIMIT / 1000)}k chars) — extra content was truncated.`);
       break;
     }
     attachedDocs = attachedDocs.filter((d) => d.name !== f.name);
     attachedDocs.push({name: f.name, content: text});
     total += text.length;
-    if (attachedDocs.length >= 50) break;
+    if (attachedDocs.length >= 5000) break;
   }
   input.value = "";
   renderDocsChips();
@@ -521,15 +521,27 @@ async function scanVault(silent) {
   try { localStorage.setItem("planner.docsPath", path); } catch (_) {}
   if ($("docsStatus")) $("docsStatus").textContent = "Scanning folder…";
   try {
-    const res = await fetch("/api/docs/scan", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({path})});
+    const res = await fetch("/api/docs/scan", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
+      path,
+      query: $("idea") ? $("idea").value : "",
+      model: $("model") ? $("model").value.trim() : "",
+    })});
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `Scan failed (${res.status})`);
     vaultPath = data.path || path;
     vaultFiles = data.files || [];
     if (pathInput && data.path) pathInput.value = data.path;
     renderDocsChips();
-    if ($("docsStatus") && data.truncated) {
-      $("docsStatus").textContent += " (capped at 50 files / 30k chars — most relevant first by filename order)";
+    if ($("docsStatus")) {
+      const found = data.total_files ?? vaultFiles.length;
+      const used = vaultFiles.length;
+      const budgetK = Math.round((data.budget || DOCS_TOTAL_LIMIT) / 1000);
+      const batches = data.batches || 1;
+      if (data.truncated) {
+        $("docsStatus").textContent += ` (scanned ${found} file(s) in ${batches} batch(es) — using top ${used} within ~${budgetK}k chars, most relevant first)`;
+      } else {
+        $("docsStatus").textContent += ` (scanned ${found} file(s), all fit in the ~${budgetK}k char budget)`;
+      }
     }
   } catch (e) {
     vaultFiles = [];
