@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Idea Planner — dump it, plan it</title>
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">🧠 Idea Planner</div>
+    <button id="newBtn" class="primary">+ New idea</button>
+    <div id="planList" class="plan-list"></div>
+    <details class="settings">
+      <summary>⚙️ LLM settings</summary>
+      <label>Base URL <input id="baseUrl" placeholder="https://api.openai.com/v1" /></label>
+      <label>Model <input id="model" placeholder="gpt-4o-mini" /></label>
+      <label>API key <input id="apiKey" type="password" placeholder="sk-... (blank = offline mode)" /></label>
+      <p class="hint">Key stays in your browser (localStorage). No key = offline template plan. Works with any OpenAI-compatible API.</p>
+    </details>
+  </aside>
+  <main class="main" id="main">
+    <section id="dumpSection" class="hero">
+      <h1 class="hero-title">Dump your idea — messy is fine:</h1>
+      <textarea id="idea" placeholder="Just brain-dump everything: what, why, for whom, constraints, half-thoughts...&#10;&#10;Example: I want to start a weekly newsletter about indie hackers in Berlin, monetize later with sponsorships, I have 3h/week..."></textarea>
+      <div class="hero-actions">
+        <button id="generateBtn" class="primary big">✨ Generate concrete steps</button>
+      </div>
+    </section>
+    <section id="resultSection" class="hidden">
+      <div class="result-head">
+        <h2 id="generatedTitle"></h2>
+        <span id="sourceBadge" class="badge hidden"></span>
+      </div>
+      <div id="warning" class="warning hidden"></div>
+      <details id="ideaRecap">
+        <summary>Show original dump</summary>
+        <p id="ideaRecapText"></p>
+      </details>
+      <div class="actions">
+        <button id="regenerateBtn">↻ Regenerate</button>
+        <div class="spacer"></div>
+        <button id="saveBtn">💾 Save</button>
+        <button id="deleteBtn" class="danger">Delete</button>
+      </div>
+      <label class="section-label">Plan (editable Markdown, checkboxes persist):</label>
+      <div class="editor-grid">
+        <textarea id="planMd" placeholder="Your concrete steps will appear here..."></textarea>
+        <div id="preview" class="preview"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
