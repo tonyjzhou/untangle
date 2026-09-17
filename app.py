@@ -77,6 +77,122 @@ updated: {now}
     return parse_plan_file(path)
 
 
+# Reference-docs ingestion (Obsidian vault / notes folder / uploads).
+# Two supply routes, often combined:
+# 1. Uploaded files — browser reads .md/.txt and sends [{name, content}].
+# 2. Server-local folder — UI sends docsPath, server scans + reads it
+#    (works because the app runs locally via `make dev`).
+DOCS_ALLOWED_EXTS = {".md", ".markdown", ".txt"}
+DOCS_SKIP_DIRS = {".git", ".obsidian", ".trash", "node_modules", "__pycache__", ".venv", "venv", ".DS_Store"}
+DOCS_MAX_FILES = 50
+DOCS_MAX_CHARS_PER_FILE = 8000
+DOCS_MAX_TOTAL_CHARS = 30000
+
+
+def _is_allowed_doc(path: Path) -> bool:
+    if path.suffix.lower() not in DOCS_ALLOWED_EXTS:
+        return False
+    return not any(part in DOCS_SKIP_DIRS for part in path.parts)
+
+
+def read_docs_dir(dirpath: str) -> dict:
+    """Scan a server-local folder for readable docs. Capped + truncated."""
+    base = Path(dirpath).expanduser()
+    if not str(dirpath).strip():
+        raise ValueError("No folder path given.")
+    if not base.exists():
+        raise ValueError(f"Folder not found: {dirpath}")
+    if not base.is_dir():
+        raise ValueError(f"Not a folder: {dirpath}")
+    found = []
+    for ext in ("*.md", "*.markdown", "*.txt"):
+        found.extend(base.rglob(ext))
+    found = sorted({p for p in found if p.is_file() and _is_allowed_doc(p)})
+    files_out = []
+    combined_parts = []
+    total_chars = 0
+    truncated = False
+    for p in found[:DOCS_MAX_FILES]:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        if len(text) > DOCS_MAX_CHARS_PER_FILE:
+            text = text[:DOCS_MAX_CHARS_PER_FILE] + "\n[…truncated…]"
+            truncated = True
+        rel = str(p.relative_to(base))
+        files_out.append({"name": rel, "chars": len(text)})
+        if total_chars + len(text) > DOCS_MAX_TOTAL_CHARS:
+            remaining = DOCS_MAX_TOTAL_CHARS - total_chars
+            if remaining > 500:
+                combined_parts.append(f"--- {rel} ---\n{text[:remaining]}\n[…vault truncated at budget…]")
+            truncated = True
+            total_chars = DOCS_MAX_TOTAL_CHARS
+            break
+        combined_parts.append(f"--- {rel} ---\n{text}")
+        total_chars += len(text)
+    if len(found) > DOCS_MAX_FILES:
+        truncated = True
+    return {
+        "path": str(base.resolve()),
+        "files": files_out,
+        "total_files": len(files_out),
+        "total_chars": total_chars,
+        "truncated": truncated,
+        "combined": "\n\n".join(combined_parts),
+    }
+
+
+def normalize_uploaded_docs(docs) -> list:
+    """Validate + cap client-uploaded [{name, content}] payloads."""
+    clean = []
+    total = 0
+    for d in (docs or [])[:DOCS_MAX_FILES]:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name") or "untitled.md")[:120]
+        content = str(d.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > DOCS_MAX_CHARS_PER_FILE:
+            content = content[:DOCS_MAX_CHARS_PER_FILE] + "\n[…truncated…]"
+        if total + len(content) > DOCS_MAX_TOTAL_CHARS:
+            remaining = DOCS_MAX_TOTAL_CHARS - total
+            if remaining > 500:
+                clean.append({"name": name, "content": content[:remaining] + "\n[…truncated at budget…]"})
+            break
+        clean.append({"name": name, "content": content})
+        total += len(content)
+    return clean
+
+
+def get_docs_context(data: dict) -> tuple:
+    """Return (context_block, sources) from uploads and/or a server folder."""
+    uploaded = normalize_uploaded_docs(data.get("docs"))
+    docs_path = (data.get("docsPath") or data.get("docs_path") or "").strip() if isinstance(data, dict) else ""
+    vault = None
+    vault_error = None
+    if docs_path:
+        try:
+            vault = read_docs_dir(docs_path)
+        except Exception as e:
+            vault_error = str(e)
+    parts = []
+    sources = []
+    for d in uploaded:
+        parts.append(f"--- {d['name']} (uploaded) ---\n{d['content']}")
+        sources.append(d["name"])
+    if vault and vault["combined"]:
+        parts.append(f"--- vault: {vault['path']} ---\n{vault['combined']}")
+        sources.extend(f["name"] for f in vault["files"])
+    if vault_error:
+        parts.append(f"[vault read failed for '{docs_path}': {vault_error}]")
+    context = "\n\n".join(parts).strip()
+    return context, sources, vault_error
+
+
 SYSTEM_PROMPT = """You are a pragmatic planning assistant. The user dumps a raw, messy idea.
 Turn it into a concrete, actionable plan.
 
@@ -180,14 +296,71 @@ Exact shape:
 """
 
 
-def call_llm(idea: str, api_key: str, base_url: str, model: str) -> dict:
+DOCS_SYSTEM_EXTRA = """
+Reference docs: the user attached their own notes (vault / uploaded files).
+Treat them as the primary source of truth — ground the plan in their details,
+prefer their terminology, and never invent facts that contradict them.
+When a phase or step draws directly from a doc, you may name the file
+(e.g. "per garden-notes.md"). Be specific to THESE docs, no generic filler.
+"""
+
+DOCS_EXTRACT_EXTRA = """
+No idea dump was given — extract mode: scan the reference docs, surface the
+2-3 most promising executable ideas lurking in them, pick the single best one
+(concrete, scoped, high-leverage), and build the whole plan for it.
+Make the Goal reflect the extracted idea, not a generic summary.
+"""
+
+DOCS_REFINE_EXTRA = """
+Reference docs are attached below. Keep the revision consistent with them and
+use them to resolve ambiguities instead of guessing.
+"""
+
+
+def build_generate_messages(idea: str, docs_context: str, stream: bool) -> list:
+    """Build LLM messages for generate, with or without reference docs."""
+    if stream:
+        system = STREAM_SYSTEM_PROMPT
+    else:
+        system = SYSTEM_PROMPT
+    user = f"Idea dump:\n{idea}" if idea.strip() else "(no idea dump — see reference docs)"
+    if docs_context:
+        system += DOCS_SYSTEM_EXTRA
+        if not idea.strip():
+            system += DOCS_EXTRACT_EXTRA
+            user += ("\n\nTask: extract the best executable idea from the reference docs "
+                     "below and plan it.\n")
+        else:
+            user += ("\n\nUse the reference docs below as background knowledge. "
+                     "If the idea dump is vague, let the docs disambiguate it.\n")
+        user += f"\nReference docs:\n{docs_context}"
+    else:
+        user = f"Idea dump:\n{idea}"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_refine_messages(idea: str, plan_markdown: str, instruction: str, docs_context: str) -> list:
+    system = REFINE_SYSTEM_PROMPT
+    user = (f"Original idea:\n{idea}\n\nCurrent plan:\n{plan_markdown}\n\n"
+            f"Change request:\n{instruction}\n\nReturn the full revised plan as Markdown only.")
+    if docs_context:
+        system += DOCS_REFINE_EXTRA
+        user += f"\n\nReference docs:\n{docs_context}"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def call_llm(idea: str, api_key: str, base_url: str, model: str, docs_context: str = "") -> dict:
     url = base_url.rstrip("/") + "/chat/completions"
+    messages = build_generate_messages(idea, docs_context or "", stream=False)
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Idea dump:\n{idea}"},
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "response_format": {"type": "json_object"},
     }
@@ -441,12 +614,33 @@ def delete_plan(plan_id):
     return jsonify({"error": "not found"}), 404
 
 
+@app.post("/api/docs/scan")
+def scan_docs():
+    """Scan a server-local folder (e.g. Obsidian vault) for readable docs."""
+    data = request.get_json(force=True, silent=True) or {}
+    path = (data.get("path") or data.get("docsPath") or "").strip()
+    if not path:
+        return jsonify({"error": "Give a folder path to scan."}), 400
+    try:
+        result = read_docs_dir(path)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({
+        "path": result["path"],
+        "files": result["files"],
+        "total_files": result["total_files"],
+        "total_chars": result["total_chars"],
+        "truncated": result["truncated"],
+    })
+
+
 @app.post("/api/generate")
 def generate():
     data = request.get_json(force=True)
     idea = (data.get("idea") or "").strip()
-    if len(idea) < 5:
-        return jsonify({"error": "Idea is too short — dump a bit more detail."}), 400
+    docs_context, docs_sources, vault_error = get_docs_context(data)
+    if len(idea) < 5 and not docs_context:
+        return jsonify({"error": "Idea is too short — dump a bit more detail, or attach reference docs."}), 400
     api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
     base_url = (data.get("baseUrl") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
     model = (data.get("model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
@@ -454,20 +648,27 @@ def generate():
     source = "local"
     try:
         if api_key:
-            plan_json = call_llm(idea, api_key, base_url, model)
+            plan_json = call_llm(idea, api_key, base_url, model, docs_context)
             source = "llm"
         else:
-            plan_json = local_fallback_plan(idea)
+            plan_json = local_fallback_plan(idea or "Extract best idea from reference docs")
     except Exception as e:
         # Graceful fallback: still return a usable plan
-        plan_json = local_fallback_plan(idea)
+        plan_json = local_fallback_plan(idea or "Extract best idea from reference docs")
         return jsonify({
             "plan": plan_json,
             "markdown": json_to_markdown(plan_json),
             "source": "local",
+            "docs_sources": docs_sources,
             "warning": f"LLM call failed, used offline plan instead: {e}",
         })
-    return jsonify({"plan": plan_json, "markdown": json_to_markdown(plan_json), "source": source})
+    out: dict = {"plan": plan_json, "markdown": json_to_markdown(plan_json), "source": source}
+    if docs_sources:
+        out["docs_sources"] = docs_sources
+        out["docs_count"] = len(docs_sources)
+    if vault_error:
+        out["warning"] = f"Reference folder could not be read ({vault_error}) — plan used the idea dump only."
+    return jsonify(out)
 
 
 def _llm_config(data: dict):
@@ -495,16 +696,17 @@ def refine():
             "source": "local",
             "warning": "Refine needs an API key — offline mode can't rewrite plans. Add a key in LLM settings.",
         })
-    messages = [
-        {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-        {"role": "user", "content": f"Original idea:\n{idea}\n\nCurrent plan:\n{plan_markdown}\n\nChange request:\n{instruction}\n\nReturn the full revised plan as Markdown only."},
-    ]
+    docs_context, docs_sources, _ = get_docs_context(data)
+    messages = build_refine_messages(idea, plan_markdown, instruction, docs_context)
     try:
         markdown = call_llm_markdown(messages, api_key, base_url, model)
     except Exception as e:
         return jsonify({"error": f"LLM refine failed: {e}"}), 502
-    goal = extract_goal_from_markdown(markdown, idea)
-    return jsonify({"markdown": markdown, "goal": goal, "source": "llm"})
+    goal = extract_goal_from_markdown(markdown, idea or "Refined plan")
+    out: dict = {"markdown": markdown, "goal": goal, "source": "llm"}
+    if docs_sources:
+        out["docs_sources"] = docs_sources
+    return jsonify(out)
 
 
 def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
@@ -514,22 +716,33 @@ def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
     data = request.get_json(force=True)
     idea_val = (data.get("idea") or idea or "").strip()
     api_key, base_url, model = _llm_config(data)
+    docs_context, docs_sources, _ = get_docs_context(data)
 
     def gen():
         yield sse({"type": "status", "message": "Contacting AI…"})
         if not api_key:
             yield sse({"type": "status", "message": "No API key — building offline plan…"})
-            md = json_to_markdown(local_fallback_plan(idea_val or "Untitled"))
+            md = json_to_markdown(local_fallback_plan(idea_val or "Extract best idea from reference docs"))
             # Chunk the offline plan so the UI still streams instead of popping in.
             for i in range(0, len(md), 200):
                 yield sse({"type": "delta", "text": md[i:i + 200]})
                 time.sleep(0.02)
-            yield sse({"type": "done", "markdown": md,
-                       "goal": extract_goal_from_markdown(md, idea_val),
-                       "source": "local"})
+            done_offline: dict = {"type": "done", "markdown": md,
+                       "goal": extract_goal_from_markdown(md, idea_val or "Reference docs"),
+                       "source": "local"}
+            if docs_sources:
+                done_offline["docs_sources"] = docs_sources
+                done_offline["warning"] = (
+                    "Offline mode can't mine your docs — connect an API key to extract "
+                    "ideas from them. This is a generic template plan."
+                )
+            yield sse(done_offline)
             return
         messages = messages_fn(data)
-        yield sse({"type": "status", "message": "AI is drafting your plan — streaming…"})
+        if docs_context:
+            yield sse({"type": "status", "message": f"AI is reading {len(docs_sources)} doc(s) + drafting your plan — streaming…"})
+        else:
+            yield sse({"type": "status", "message": "AI is drafting your plan — streaming…"})
         full = []
         warning = None
         truncated = False
@@ -565,8 +778,10 @@ def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
             yield sse({"type": "error", "error": "Empty response from AI."})
             return
         done_payload: dict = {"type": "done", "markdown": markdown,
-                        "goal": extract_goal_from_markdown(markdown, idea_val),
+                        "goal": extract_goal_from_markdown(markdown, idea_val or "Reference docs"),
                         "source": "llm"}
+        if docs_sources:
+            done_payload["docs_sources"] = docs_sources
         if warning:
             done_payload["warning"] = warning
         if truncated:
@@ -582,14 +797,13 @@ def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
 def generate_stream():
     data = request.get_json(force=True, silent=True) or {}
     idea = (data.get("idea") or "").strip()
-    if len(idea) < 5:
-        return jsonify({"error": "Idea is too short — dump a bit more detail."}), 400
+    docs_context, _, _ = get_docs_context(data)
+    if len(idea) < 5 and not docs_context:
+        return jsonify({"error": "Idea is too short — dump a bit more detail, or attach reference docs."}), 400
 
     def messages_fn(_data):
-        return [
-            {"role": "system", "content": STREAM_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Idea dump:\n{idea}"},
-        ]
+        ctx, _, _ = get_docs_context(_data)
+        return build_generate_messages(idea, ctx, stream=True)
 
     return _stream_markdown_response(messages_fn, idea)
 
@@ -609,13 +823,8 @@ def refine_stream():
         return jsonify({"error": "Refine needs an API key (offline mode can't rewrite plans)."}), 400
 
     def messages_fn(_data):
-        return [
-            {"role": "system", "content": REFINE_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"Original idea:\n{idea}\n\nCurrent plan:\n{plan_markdown}\n\n"
-                f"Change request:\n{instruction}\n\nReturn the full revised plan as Markdown only."
-            )},
-        ]
+        ctx, _, _ = get_docs_context(_data)
+        return build_refine_messages(idea, plan_markdown, instruction, ctx)
 
     return _stream_markdown_response(messages_fn, idea)
 

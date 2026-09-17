@@ -4,6 +4,13 @@ let generatedGoal = "";
 let isEditing = false;
 let streamingActive = false;
 
+// Reference docs: uploaded file contents (in-memory) + server-local vault path.
+let attachedDocs = [];
+let vaultPath = "";
+let vaultFiles = [];
+const DOCS_PER_FILE_LIMIT = 8000;
+const DOCS_TOTAL_LIMIT = 30000;
+
 const store = {
   get baseUrl() { return localStorage.getItem("planner.baseUrl") || ""; },
   get model() { return localStorage.getItem("planner.model") || ""; },
@@ -431,8 +438,113 @@ function llmPayload(extra) {
     apiKey: $("apiKey").value.trim(),
     baseUrl: $("baseUrl").value.trim() || "https://api.openai.com/v1",
     model: $("model").value.trim() || "gpt-4o-mini",
+    docs: attachedDocs,
+    docsPath: vaultPath,
     ...extra,
   };
+}
+
+function hasDocs() {
+  return attachedDocs.length > 0 || (vaultPath && vaultFiles.length > 0) || (vaultPath && $("docsPath") && $("docsPath").value.trim());
+}
+
+function renderDocsChips() {
+  const wrap = $("docsChips");
+  const status = $("docsStatus");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  for (const d of attachedDocs) {
+    const s = document.createElement("span");
+    s.className = "doc-chip";
+    s.title = `${d.name} (${(d.content || "").length} chars)`;
+    s.textContent = `📄 ${d.name}`;
+    wrap.appendChild(s);
+  }
+  for (const f of vaultFiles.slice(0, 20)) {
+    const s = document.createElement("span");
+    s.className = "doc-chip vault";
+    s.title = `${f.name} (${f.chars} chars)`;
+    s.textContent = `🗂 ${f.name}`;
+    wrap.appendChild(s);
+  }
+  if (vaultFiles.length > 20) {
+    const s = document.createElement("span");
+    s.className = "doc-chip vault";
+    s.textContent = `+${vaultFiles.length - 20} more`;
+    wrap.appendChild(s);
+  }
+  if (status) {
+    const parts = [];
+    if (attachedDocs.length) parts.push(`${attachedDocs.length} file(s) attached`);
+    if (vaultFiles.length) parts.push(`${vaultFiles.length} vault file(s)`);
+    else if (vaultPath) parts.push(`vault: ${vaultPath} (not scanned yet — hit Scan)`);
+    status.textContent = parts.length
+      ? `Using ${parts.join(" + ")} as background. Leave the idea empty to extract the best idea from them.`
+      : "";
+  }
+}
+
+async function handleDocsFiles(input) {
+  const files = Array.from(input.files || []).filter((f) => /\.(md|markdown|txt)$/i.test(f.name) || f.type.startsWith("text/"));
+  let total = attachedDocs.reduce((n, d) => n + (d.content || "").length, 0);
+  for (const f of files) {
+    let text = "";
+    try { text = await f.text(); } catch (_) { continue; }
+    text = (text || "").trim();
+    if (!text) continue;
+    if (text.length > DOCS_PER_FILE_LIMIT) text = text.slice(0, DOCS_PER_FILE_LIMIT) + "\n[…truncated…]";
+    if (total + text.length > DOCS_TOTAL_LIMIT) {
+      const remaining = DOCS_TOTAL_LIMIT - total;
+      if (remaining > 500) {
+        attachedDocs.push({name: f.name, content: text.slice(0, remaining) + "\n[…truncated at budget…]"});
+      }
+      alert("Docs budget reached (30k chars) — extra content was truncated.");
+      break;
+    }
+    attachedDocs = attachedDocs.filter((d) => d.name !== f.name);
+    attachedDocs.push({name: f.name, content: text});
+    total += text.length;
+    if (attachedDocs.length >= 50) break;
+  }
+  input.value = "";
+  renderDocsChips();
+}
+
+async function scanVault(silent) {
+  const pathInput = $("docsPath");
+  const path = (pathInput ? pathInput.value : vaultPath || "").trim();
+  if (!path) {
+    if (!silent) alert("Enter a local folder path first (e.g. your Obsidian vault).");
+    return;
+  }
+  vaultPath = path;
+  try { localStorage.setItem("planner.docsPath", path); } catch (_) {}
+  if ($("docsStatus")) $("docsStatus").textContent = "Scanning folder…";
+  try {
+    const res = await fetch("/api/docs/scan", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({path})});
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Scan failed (${res.status})`);
+    vaultPath = data.path || path;
+    vaultFiles = data.files || [];
+    if (pathInput && data.path) pathInput.value = data.path;
+    renderDocsChips();
+    if ($("docsStatus") && data.truncated) {
+      $("docsStatus").textContent += " (capped at 50 files / 30k chars — most relevant first by filename order)";
+    }
+  } catch (e) {
+    vaultFiles = [];
+    renderDocsChips();
+    if ($("docsStatus")) $("docsStatus").textContent = `Couldn't read that folder: ${e.message}`;
+  }
+}
+
+function clearDocs() {
+  attachedDocs = [];
+  vaultPath = "";
+  vaultFiles = [];
+  if ($("docsPath")) $("docsPath").value = "";
+  try { localStorage.removeItem("planner.docsPath"); } catch (_) {}
+  renderDocsChips();
 }
 
 // POST an SSE endpoint and dispatch parsed `data:` events.
@@ -508,7 +620,11 @@ function clearWatchdog() {
 async function generate() {
   if (streamingActive) return;
   const idea = $("idea").value.trim();
-  if (idea.length < 5) { alert("Dump a bit more detail first."); return; }
+  // Docs count as input too: empty idea + docs = extract mode.
+  if (idea.length < 5 && !hasDocs()) { alert("Dump a bit more detail first — or attach reference docs."); return; }
+  if (idea.length < 5 && hasDocs() && !vaultFiles.length && vaultPath && $("docsPath") && $("docsPath").value.trim()) {
+    await scanVault(true);
+  }
   $("warning").classList.add("hidden");
   abortCtrl = new AbortController();
   const signal = abortCtrl.signal;
@@ -552,16 +668,22 @@ async function generate() {
       }
       else if (ev.type === "done") {
         accumulated = ev.markdown || accumulated;
-        generatedGoal = smartTruncate(ev.goal || idea.split("\n")[0], 220);
+        generatedGoal = smartTruncate(ev.goal || idea.split("\n")[0] || "Plan from reference docs", 220);
         $("generatedTitle").textContent = generatedGoal;
         $("planMd").value = accumulated;
         renderPreview(accumulated);
         const badge = $("sourceBadge");
         badge.classList.remove("hidden");
+        const docsSuffix = (ev.docs_sources && ev.docs_sources.length) ? ` · 📚 ${ev.docs_sources.length} doc(s)` : "";
         badge.textContent = ev.source === "llm"
-          ? (ev.truncated ? "✨ AI-generated (partial — stream stalled)" : "✨ AI-generated")
-          : "📦 Offline template (add API key for AI)";
-        if (ev.warning) showWarning(ev.warning);
+          ? (ev.truncated ? `✨ AI-generated (partial — stream stalled)${docsSuffix}` : `✨ AI-generated${docsSuffix}`)
+          : `📦 Offline template (add API key for AI)${docsSuffix}`;
+        const notes = [];
+        if (ev.docs_sources && ev.docs_sources.length) {
+          notes.push(`Grounded in: ${ev.docs_sources.slice(0, 8).join(", ")}${ev.docs_sources.length > 8 ? ` +${ev.docs_sources.length - 8} more` : ""}`);
+        }
+        if (ev.warning) notes.push(ev.warning);
+        if (notes.length) { $("warning").textContent = notes.join("\n"); $("warning").classList.remove("hidden"); }
       }
       else if (ev.type === "error") throw new Error(ev.error);
     }, signal);
@@ -694,6 +816,22 @@ $("generateBtn").onclick = generate;
 $("regenerateBtn").onclick = generate;
 $("refineBtn").onclick = refine;
 $("cancelBtn").onclick = () => { if (abortCtrl) abortCtrl.abort(); };
+if ($("docsFiles")) $("docsFiles").addEventListener("change", (e) => handleDocsFiles(e.target));
+if ($("docsScanBtn")) $("docsScanBtn").onclick = () => scanVault(false);
+if ($("docsClearBtn")) $("docsClearBtn").onclick = clearDocs;
+if ($("docsPath")) $("docsPath").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); scanVault(false); }
+});
+if ($("docsPath")) $("docsPath").addEventListener("change", () => {
+  // Path edited manually — stale scan results no longer apply.
+  vaultFiles = [];
+  vaultPath = $("docsPath").value.trim();
+  try {
+    if (vaultPath) localStorage.setItem("planner.docsPath", vaultPath);
+    else localStorage.removeItem("planner.docsPath");
+  } catch (_) {}
+  renderDocsChips();
+});
 $("refineInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); refine(); }
 });
@@ -745,6 +883,16 @@ $("preview").addEventListener("click", (e) => {
 async function boot() {
   showResult(false);
   setEditMode(false);
+  // Restore vault path before anything else so generate() can use it.
+  try {
+    const savedPath = localStorage.getItem("planner.docsPath") || "";
+    if (savedPath && $("docsPath")) {
+      $("docsPath").value = savedPath;
+      vaultPath = savedPath;
+      scanVault(true);
+    }
+  } catch (_) {}
+  renderDocsChips();
   await refreshList();
   // Restore last-open plan or unsaved draft so refresh never loses ideas.
   let restoredId = null;

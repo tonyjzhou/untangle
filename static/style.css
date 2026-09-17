@@ -104,6 +104,16 @@ details[open] .chev { transform:rotate(180deg); }
 .refine-box { display:flex; flex-direction:column; gap:6px; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
 .refine-row { display:flex; gap:8px; }
 .refine-row input { flex:1; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:#0f1115; color:var(--text); font-size:14px; }
+.docs-box { display:flex; flex-direction:column; gap:8px; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
+.docs-box .hint { margin:0; }
+.docs-box code { background:#0f1115; border:1px solid var(--border); border-radius:6px; padding:1px 6px; font-size:12px; }
+.docs-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.docs-row input#docsPath { flex:1; min-width:220px; padding:9px 12px; border-radius:8px; border:1px solid var(--border); background:#0f1115; color:var(--text); font-size:13px; }
+.file-btn { padding:9px 14px; border-radius:8px; border:1px solid var(--border); background:#222839; color:var(--text); cursor:pointer; font-size:13px; white-space:nowrap; }
+.file-btn:hover { border-color:var(--accent); }
+.docs-chips { display:flex; gap:6px; flex-wrap:wrap; }
+.doc-chip { font-size:12px; padding:3px 9px; border-radius:99px; background:#1e2a3f; border:1px solid #33507a; color:#bcd3ea; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.doc-chip.vault { background:#24301f; border-color:#4a6b3a; color:#c8e6b8; }
 .preview.streaming { opacity:1; }
 .preview.streaming::after { content:"▍"; color:var(--accent); animation:blink 0.8s steps(1) infinite; }
 @keyframes blink { 50% { opacity:0; } }

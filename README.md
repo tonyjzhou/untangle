@@ -6,9 +6,12 @@ Dump a messy idea, get a concrete plan.
 
 ## How it works
 
-1. Paste your idea dump into the textarea
-2. Click **Generate concrete steps**
-3. Edit the Markdown, toggle checkboxes, Save
+1. Paste your idea dump into the textarea (or leave it empty if your notes hold the idea)
+2. Optionally attach reference docs: 📎 upload `.md` / `.txt` files, or enter a local folder path (e.g. an Obsidian vault) and hit **Scan**
+3. Click **Generate concrete steps**
+4. Edit the Markdown, toggle checkboxes, Save
+
+With reference docs attached, the AI grounds the plan in your notes — preferring their details and terminology. With an empty idea + docs, it switches to extract mode: it surfaces the best executable idea lurking in your docs and plans that.
 
 Two generation modes:
 - **AI mode** — provide any OpenAI-compatible API key + base URL + model (key stays in browser `localStorage`, or set `OPENAI_API_KEY` env var server-side)
@@ -40,10 +43,11 @@ Or per-request from the UI sidebar (⚙️ LLM settings) — stored only in your
 
 ## API
 
-- `POST /api/generate` `{idea, apiKey?, baseUrl?, model?}` → `{plan, markdown, source}`
+- `POST /api/generate` `{idea, docs?, docsPath?, apiKey?, baseUrl?, model?}` → `{plan, markdown, source, docs_sources?}`
 - `POST /api/generate/stream` (SSE) same input → `status` / `delta` / `done` events, plan streams in live so Regenerate never sits silent
-- `POST /api/refine` `{idea, plan_markdown, instruction, apiKey?, baseUrl?, model?}` → `{markdown, goal, source}` (needs API key)
+- `POST /api/refine` `{idea, plan_markdown, instruction, docs?, docsPath?, apiKey?, baseUrl?, model?}` → `{markdown, goal, source}` (needs API key)
 - `POST /api/refine/stream` (SSE) same input → live-refines the plan from a follow-up prompt
+- `POST /api/docs/scan` `{path}` → `{path, files: [{name, chars}], total_files, total_chars, truncated}` (scans a server-local folder for `.md` / `.markdown` / `.txt`, skips `.git`, `.obsidian`, `node_modules`, etc.; capped at 50 files / 30k chars)
 - `GET /api/plans` → list `{id, title, created, updated}`
 - `POST /api/plans` `{title, raw_idea, plan_markdown}` → saved plan
 - `GET /api/plans/<id>` → `{id, title, raw_idea, plan_markdown, ...}`

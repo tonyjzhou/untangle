@@ -24,6 +24,18 @@
     <section id="dumpSection" class="hero">
       <h1 class="hero-title">Dump your idea — messy is fine:</h1>
       <textarea id="idea" placeholder="Just brain-dump everything: what, why, for whom, constraints, half-thoughts...&#10;&#10;Example: I want to start a weekly newsletter about indie hackers in Berlin, monetize later with sponsorships, I have 3h/week..."></textarea>
+      <div class="docs-box">
+        <label class="section-label" for="docsPath">📚 Reference docs (optional) — mine ideas from your notes</label>
+        <p class="hint">Attach <code>.md</code> / <code>.txt</code> files or point at a local folder (e.g. an Obsidian vault). The AI grounds the plan in them — or leave the idea empty and it will extract the best executable idea from them.</p>
+        <div class="docs-row">
+          <label class="file-btn" for="docsFiles">📎 Attach files<input id="docsFiles" type="file" multiple accept=".md,.markdown,.txt,text/markdown,text/plain" class="hidden" /></label>
+          <input id="docsPath" placeholder="/Users/you/Documents/obsidian-vault  (folder must be on this machine)" />
+          <button id="docsScanBtn" type="button">Scan</button>
+          <button id="docsClearBtn" type="button" class="ghost">Clear</button>
+        </div>
+        <div id="docsStatus" class="hint" aria-live="polite"></div>
+        <div id="docsChips" class="docs-chips"></div>
+      </div>
       <div class="hero-actions">
         <button id="generateBtn" class="primary big">✨ Generate concrete steps</button>
       </div>
