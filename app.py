@@ -82,8 +82,9 @@ Turn it into a concrete, actionable plan.
 
 Rules:
 - Infer a clear 1-sentence goal even if the idea is vague. Ask nothing; make best guess.
+- The goal MUST be one complete, self-contained sentence, max 18 words (it is shown as the plan title, never truncated mid-sentence).
 - Break into 3-5 phases/milestones, each with concrete steps (not vague advice).
-- Each step must be small enough to do in one sitting (<=2h). Start each step with a verb.
+- Each step must be small enough to do in one sitting (<=2h). Start each step with a verb. Keep each step under 18 words.
 - Include for each step: checkbox, effort estimate (S/M/L), and priority (P1/P2/P3).
 - End with: Success criteria (3 measurable checks), Risks (2-3), and Next 3 immediate actions.
 - Keep total steps between 7 and 15. Be specific to THIS idea, no generic filler.
@@ -162,10 +163,10 @@ Turn it into a concrete, actionable plan. Output Markdown ONLY (no JSON, no code
 Exact shape:
 ## Plan
 
-**Goal:** <one clear sentence>
+**Goal:** <one complete self-contained sentence, max 18 words — this is shown as the plan title>
 
 ### Phase 1: <name>
-- [ ] <step starting with a verb> `[S|M|L/P1|P2|P3]`
+- [ ] <step starting with a verb, under 18 words> `[S|M|L/P1|P2|P3]`
 ... (3-5 phases, 7-15 steps total, each step doable in <=2h)
 
 ### Success criteria
@@ -262,12 +263,25 @@ def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model:
                     yield delta
 
 
+def smart_truncate(text: str, limit: int = 220) -> str:
+    """Truncate at a word boundary with an ellipsis — never cut mid-word."""
+    text = " ".join(text.strip().split())
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut].rstrip(" ,;:—-") + "…"
+
+
 def extract_goal_from_markdown(markdown: str, fallback: str) -> str:
     m = re.search(r"\*\*Goal:\*\*\s*(.+)", markdown)
     if m:
-        return m.group(1).strip()[:120]
-    first = (fallback.strip().splitlines() or ["Untitled"])[0][:120]
-    return first
+        # Goal is a single Markdown line — keep the whole sentence,
+        # only smart-truncating absurdly long goals at a word boundary.
+        return smart_truncate(m.group(1).strip(), 220)
+    first = (fallback.strip().splitlines() or ["Untitled"])[0]
+    return smart_truncate(first, 220)
 
 
 def sse(data: dict) -> str:

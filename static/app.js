@@ -26,17 +26,191 @@ function showResult(visible) {
   }
 }
 
-function renderPreview(md) {
-  let checkIdx = 0;
-  let html = md
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/^### (.*)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
+function smartTruncate(text, limit) {
+  limit = limit || 220;
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (clean.length <= limit) return clean;
+  let cut = clean.lastIndexOf(" ", limit);
+  if (cut < limit / 2) cut = limit;
+  return clean.slice(0, cut).replace(/[,;:—\-–\s]+$/, "") + "…";
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function inlineMd(s) {
+  return escHtml(s)
     .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/^- \[ \] (.*)$/gm, (m, t) => `<li><input type="checkbox" data-check="${checkIdx++}"> ${t}</li>`)
-    .replace(/^- \[[xX]\] (.*)$/gm, (m, t) => `<li><input type="checkbox" checked data-check="${checkIdx++}"> ${t}</li>`)
-    .replace(/^- (.*)$/gm, "<li>$1</li>");
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+function parseEffortPriority(text) {
+  const m = text.match(/`?\[([SML])\/([Pp][123])\]`?/);
+  if (!m) return {clean: text.trim(), effort: null, priority: null};
+  return {
+    clean: text.replace(m[0], "").replace(/\s{2,}/g, " ").trim(),
+    effort: m[1].toUpperCase(),
+    priority: m[2].toUpperCase(),
+  };
+}
+
+function pillHtml(effort, priority) {
+  let out = "";
+  if (effort) out += `<span class="pill effort-${effort.toLowerCase()}" title="Effort: ${effort}">${effort}</span>`;
+  if (priority) out += `<span class="pill pri-${priority.toLowerCase()}" title="Priority: ${priority}">${priority}</span>`;
+  return out;
+}
+
+window.toggleAllPhases = function(open) {
+  document.querySelectorAll("#preview details.phase-card, #preview details.mini-card").forEach((d) => {
+    // Keep "Do next" always visible — it's a div, not a details, so untouched.
+    d.open = !!open;
+  });
+};
+
+function renderPreview(md) {
+  const raw = String(md || "");
+  if (!raw.trim()) {
+    $("preview").innerHTML = "";
+    return;
+  }
+  const lines = raw.split("\n");
+  let goal = "";
+  const sections = [];
+  let current = null;
+  let checkIdx = 0;
+
+  const pushSection = (kind, title) => {
+    current = {kind, title: (title || "").trim(), items: []};
+    sections.push(current);
+  };
+
+  for (let line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (/^##\s+Plan/i.test(t)) continue;
+    let gm = t.match(/\*\*Goal:\*\*\s*(.*)/);
+    if (gm) {
+      goal = gm[1].replace(/\*\*/g, "").trim();
+      continue;
+    }
+    let hm = t.match(/^###\s+(.*)/);
+    if (hm) {
+      const title = hm[1].trim();
+      const low = title.toLowerCase();
+      if (/^phase\b/.test(low) || /^phase\s*\d/i.test(title)) pushSection("phase", title);
+      else if (low.includes("success")) pushSection("success", "Success criteria");
+      else if (low.includes("risk")) pushSection("risks", "Risks");
+      else if (low.includes("do next") || low.includes("today") || low.includes("next")) pushSection("next", "Do next");
+      else pushSection("generic", title);
+      continue;
+    }
+    let cm = t.match(/^- \[[ xX]\]\s*(.*)$/);
+    if (cm) {
+      const checked = /^- \[[xX]\]/.test(t);
+      if (!current) pushSection("generic", "");
+      const parsed = parseEffortPriority(cm[1]);
+      current.items.push({type: "check", text: parsed.clean, effort: parsed.effort, priority: parsed.priority, checked, idx: checkIdx++});
+      continue;
+    }
+    let bm = t.match(/^- (.*)$/);
+    if (bm) {
+      if (!current) pushSection("generic", "");
+      current.items.push({type: "bullet", text: bm[1].trim()});
+      continue;
+    }
+    // Fallback paragraph (e.g. streaming partial line)
+    if (!current) pushSection("generic", "");
+    current.items.push({type: "para", text: t});
+  }
+
+  const totalChecks = sections.flatMap((s) => s.items).filter((i) => i.type === "check").length;
+  const doneChecks = sections.flatMap((s) => s.items).filter((i) => i.type === "check" && i.checked).length;
+  const pct = totalChecks ? Math.round((doneChecks / totalChecks) * 100) : 0;
+  const phaseSections = sections.filter((s) => s.kind === "phase");
+
+  let html = "";
+  html += `<div class="roadmap-head">
+    <div class="roadmap-title">✨ Your roadmap</div>
+    <div class="roadmap-sub">${phaseSections.length} phase${phaseSections.length === 1 ? "" : "s"} · ${doneChecks} of ${totalChecks} done</div>
+    <div class="roadmap-bar"><i style="width:${pct}%"></i></div>
+    <div class="roadmap-toggles">
+      <button type="button" onclick="toggleAllPhases(true)">Expand all</button>
+      <button type="button" onclick="toggleAllPhases(false)">Collapse</button>
+    </div>
+  </div>`;
+
+  if (goal) {
+    html += `<div class="goal-card"><span class="goal-emoji">🎯</span><span>${inlineMd(goal)}</span></div>`;
+  }
+
+  const phaseEmoji = ["🛠️", "⚙️", "🚀", "🔁", "🌱", "✨"];
+  let phaseCount = 0;
+  for (const s of sections) {
+    if (s.kind === "phase") {
+      phaseCount++;
+      const numMatch = s.title.match(/phase\s*(\d+)/i);
+      const num = numMatch ? numMatch[1] : String(phaseCount);
+      const name = s.title.replace(/^phase\s*\d+\s*[:\-–.]?\s*/i, "").trim() || s.title;
+      const checks = s.items.filter((i) => i.type === "check");
+      const done = checks.filter((i) => i.checked).length;
+      const ppct = checks.length ? Math.round((done / checks.length) * 100) : 0;
+      const emoji = phaseEmoji[(phaseCount - 1) % phaseEmoji.length];
+      html += `<details class="phase-card">`;
+      html += `<summary><span class="phase-num">${escHtml(num)}</span>
+        <span class="phase-main"><span class="phase-name">${emoji} ${inlineMd(name)}</span>
+        <span class="phase-meta">${done}/${checks.length} done</span></span>
+        <span class="phase-bar"><i style="width:${ppct}%"></i></span>
+        <span class="chev" aria-hidden="true">▾</span></summary>`;
+      html += `<ul class="steps">`;
+      for (const it of s.items) {
+        if (it.type === "check") {
+          html += `<li class="step${it.checked ? " done" : ""}"><label><input type="checkbox" data-check="${it.idx}"${it.checked ? " checked" : ""}> <span class="step-text">${inlineMd(it.text)}</span> ${pillHtml(it.effort, it.priority)}</label></li>`;
+        } else if (it.type === "bullet") {
+          html += `<li class="bullet">${inlineMd(it.text)}</li>`;
+        } else {
+          html += `<li class="para">${inlineMd(it.text)}</li>`;
+        }
+      }
+      html += `</ul></details>`;
+    } else if (s.kind === "success") {
+      const checks = s.items.filter((i) => i.type === "check");
+      const done = checks.filter((i) => i.checked).length;
+      html += `<details class="mini-card success"><summary><span class="mini-emoji">✅</span> <b>Success criteria</b> <span class="mini-meta">${done}/${checks.length}</span> <span class="chev" aria-hidden="true">▾</span></summary><ul class="steps">`;
+      for (const it of s.items) {
+        if (it.type === "check") html += `<li class="step${it.checked ? " done" : ""}"><label><input type="checkbox" data-check="${it.idx}"${it.checked ? " checked" : ""}> <span class="step-text">${inlineMd(it.text)}</span> ${pillHtml(it.effort, it.priority)}</label></li>`;
+        else html += `<li class="bullet">${inlineMd(it.text)}</li>`;
+      }
+      html += `</ul></details>`;
+    } else if (s.kind === "risks") {
+      html += `<details class="mini-card risks"><summary><span class="mini-emoji">⚠️</span> <b>Risks</b> <span class="mini-meta">${s.items.length}</span> <span class="chev" aria-hidden="true">▾</span></summary><ul class="risks-list">`;
+      for (const it of s.items) html += `<li>${inlineMd(it.text)}</li>`;
+      html += `</ul></details>`;
+    } else if (s.kind === "next") {
+      html += `<div class="next-card"><div class="next-head"><span>⚡</span> <b>Do next — today</b></div><ul class="steps">`;
+      for (const it of s.items) {
+        if (it.type === "check") html += `<li class="step${it.checked ? " done" : ""}"><label><input type="checkbox" data-check="${it.idx}"${it.checked ? " checked" : ""}> <span class="step-text">${inlineMd(it.text)}</span> ${pillHtml(it.effort, it.priority)}</label></li>`;
+        else html += `<li class="bullet">${inlineMd(it.text)}</li>`;
+      }
+      html += `</ul></div>`;
+    } else {
+      if (!s.title && s.items.length === 0) continue;
+      if (s.title) html += `<div class="generic-card"><b>${inlineMd(s.title)}</b><ul class="steps">`;
+      else html += `<div class="generic-card"><ul class="steps">`;
+      for (const it of s.items) {
+        if (it.type === "check") html += `<li class="step${it.checked ? " done" : ""}"><label><input type="checkbox" data-check="${it.idx}"${it.checked ? " checked" : ""}> <span class="step-text">${inlineMd(it.text)}</span> ${pillHtml(it.effort, it.priority)}</label></li>`;
+        else html += `<li class="bullet">${inlineMd(it.text)}</li>`;
+      }
+      html += `</ul></div>`;
+    }
+  }
+
+  if (!sections.length && !goal) {
+    // Extremely early stream chunk — fall back to plain text so something shows.
+    html += `<div class="generic-card">${inlineMd(raw.slice(0, 500))}</div>`;
+  }
+
   $("preview").innerHTML = html;
 }
 
@@ -267,7 +441,7 @@ async function generate() {
       }
       else if (ev.type === "done") {
         accumulated = ev.markdown || accumulated;
-        generatedGoal = (ev.goal || idea.split("\n")[0]).slice(0, 80);
+        generatedGoal = smartTruncate(ev.goal || idea.split("\n")[0], 220);
         $("generatedTitle").textContent = generatedGoal;
         $("planMd").value = accumulated;
         renderPreview(accumulated);
@@ -337,7 +511,7 @@ async function refine() {
         $("planMd").value = accumulated;
         renderPreview(accumulated);
         if (ev.goal) {
-          generatedGoal = ev.goal.slice(0, 80);
+          generatedGoal = smartTruncate(ev.goal, 220);
           $("generatedTitle").textContent = generatedGoal;
         }
         $("refineInput").value = "";
@@ -378,7 +552,7 @@ $("refineInput").addEventListener("keydown", (e) => {
 
 $("saveBtn").onclick = async () => {
   const payload = {
-    title: generatedGoal || $("idea").value.split("\n")[0].slice(0, 80) || "Untitled",
+    title: generatedGoal || smartTruncate($("idea").value.split("\n")[0], 220) || "Untitled",
     raw_idea: $("idea").value,
     plan_markdown: $("planMd").value,
   };
