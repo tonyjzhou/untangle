@@ -815,7 +815,7 @@ def refine():
         return jsonify({
             "markdown": plan_markdown,
             "source": "local",
-            "warning": "Refine needs an API key — offline mode can't rewrite plans. Add a key in LLM settings.",
+            "warning": "Refine needs an API key — offline mode can't rewrite plans. Open ⚙️ LLM settings in the left sidebar and add a key.",
         })
     docs_context, docs_sources, _ = get_docs_context(data)
     messages = build_refine_messages(idea, plan_markdown, instruction, docs_context)
@@ -854,8 +854,8 @@ def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
             if docs_sources:
                 done_offline["docs_sources"] = docs_sources
                 done_offline["warning"] = (
-                    "Offline mode can't mine your docs — connect an API key to extract "
-                    "ideas from them. This is a generic template plan."
+                    "Offline mode — no API key, so this is a generic template plan. "
+                    "Your docs were scanned locally but NOT mined by AI."
                 )
             yield sse(done_offline)
             return
@@ -941,7 +941,7 @@ def refine_stream():
         return jsonify({"error": "No plan to refine yet."}), 400
     api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        return jsonify({"error": "Refine needs an API key (offline mode can't rewrite plans)."}), 400
+        return jsonify({"error": "Refine needs an API key (offline mode can't rewrite plans). Open ⚙️ LLM settings in the left sidebar and add a key."}), 400
 
     def messages_fn(_data):
         ctx, _, _ = get_docs_context(_data)

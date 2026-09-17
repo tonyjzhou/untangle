@@ -448,6 +448,28 @@ function hasDocs() {
   return attachedDocs.length > 0 || (vaultPath && vaultFiles.length > 0) || (vaultPath && $("docsPath") && $("docsPath").value.trim());
 }
 
+function hasApiKey() {
+  return ($("apiKey") && $("apiKey").value.trim().length > 0);
+}
+
+// Point the user at the exact place to configure the LLM: the sidebar
+// ⚙️ LLM settings. Opens the collapsible, flashes it, and focuses the key.
+window.openLlmSettings = function() {
+  const box = document.getElementById("llmSettings");
+  if (box) {
+    box.open = true;
+    box.classList.remove("flash");
+    void box.offsetWidth; // restart the flash animation
+    box.classList.add("flash");
+    try { box.scrollIntoView({behavior: "smooth", block: "nearest"}); } catch (_) {}
+    setTimeout(() => box.classList.remove("flash"), 2600);
+  }
+  const key = $("apiKey");
+  if (key) {
+    try { setTimeout(() => key.focus({preventScroll: true}), 400); } catch (_) {}
+  }
+};
+
 function renderDocsChips() {
   const wrap = $("docsChips");
   const status = $("docsStatus");
@@ -632,6 +654,10 @@ function clearWatchdog() {
 async function generate() {
   if (streamingActive) return;
   const idea = $("idea").value.trim();
+  // Frontend-side hint only (the server may still have an env key) — the
+  // authoritative offline signal is `source === "local"` on the done event.
+  // Used just to keep the streaming label honest instead of claiming "AI".
+  const offlineLikely = !hasApiKey();
   // Docs count as input too: empty idea + docs = extract mode.
   if (idea.length < 5 && !hasDocs()) { alert("Dump a bit more detail first — or attach reference docs."); return; }
   if (idea.length < 5 && hasDocs() && !vaultFiles.length && vaultPath && $("docsPath") && $("docsPath").value.trim()) {
@@ -661,11 +687,15 @@ async function generate() {
   }
   let accumulated = "";
   let gotFirstDelta = false;
+  const streamingLabel = () => {
+    if (isRegen) return offlineLikely ? "Offline template streaming in…" : "New plan streaming in…";
+    return offlineLikely ? "Building offline template — streaming…" : "AI is drafting your plan — streaming…";
+  };
   const markStreaming = () => {
     if (!gotFirstDelta) {
       gotFirstDelta = true;
       $("resultSection").classList.add("streaming-active");
-      if (isRegen) updateStatus("New plan streaming in…", 0);
+      if (isRegen) updateStatus(streamingLabel(), 0);
     }
   };
   try {
@@ -676,7 +706,7 @@ async function generate() {
         accumulated += ev.text || "";
         $("planMd").value = accumulated;
         renderPreview(accumulated);
-        updateStatus(isRegen ? "New plan streaming in…" : "AI is drafting your plan — streaming…", accumulated.length);
+        updateStatus(streamingLabel(), accumulated.length);
       }
       else if (ev.type === "done") {
         accumulated = ev.markdown || accumulated;
@@ -687,15 +717,38 @@ async function generate() {
         const badge = $("sourceBadge");
         badge.classList.remove("hidden");
         const docsSuffix = (ev.docs_sources && ev.docs_sources.length) ? ` · 📚 ${ev.docs_sources.length} doc(s)` : "";
-        badge.textContent = ev.source === "llm"
+        const isOffline = ev.source !== "llm";
+        badge.textContent = !isOffline
           ? (ev.truncated ? `✨ AI-generated (partial — stream stalled)${docsSuffix}` : `✨ AI-generated${docsSuffix}`)
           : `📦 Offline template (add API key for AI)${docsSuffix}`;
+        const warnBox = $("warning");
+        warnBox.classList.add("hidden");
+        warnBox.innerHTML = "";
         const notes = [];
         if (ev.docs_sources && ev.docs_sources.length) {
           notes.push(`Grounded in: ${ev.docs_sources.slice(0, 8).join(", ")}${ev.docs_sources.length > 8 ? ` +${ev.docs_sources.length - 8} more` : ""}`);
         }
         if (ev.warning) notes.push(ev.warning);
-        if (notes.length) { $("warning").textContent = notes.join("\n"); $("warning").classList.remove("hidden"); }
+        if (isOffline) {
+          // Helpful pointer: offline template is generic — show exactly where
+          // to configure the LLM so the next run is a real AI plan.
+          const grounded = notes.length ? `<div class="warn-line">${escHtml(notes.join("\n"))}</div>` : "";
+          warnBox.innerHTML =
+            `<div class="warn-title">You're in <b>offline mode</b> — no API key set. This is a generic template plan, not AI.</div>` +
+            grounded +
+            `<div class="warn-line">To get an AI plan grounded in your docs:</div>` +
+            `<ol class="warn-steps"><li>Open <b>⚙️ LLM settings</b> in the left sidebar</li>` +
+            `<li>Paste your <b>API key</b> (Base URL + Model are prefilled for OpenAI; any OpenAI-compatible API works)</li>` +
+            `<li>Hit <b>↻ Regenerate</b></li></ol>` +
+            `<div class="warn-actions"><button type="button" class="warn-cta" onclick="openLlmSettings()">Open LLM settings</button>` +
+            `<span class="hint">Key stays in your browser (localStorage).</span></div>`;
+          warnBox.classList.remove("hidden");
+          const settingsBox = document.getElementById("llmSettings");
+          if (settingsBox && !settingsBox.open) settingsBox.open = true;
+        } else if (notes.length) {
+          warnBox.textContent = notes.join("\n");
+          warnBox.classList.remove("hidden");
+        }
       }
       else if (ev.type === "error") throw new Error(ev.error);
     }, signal);
@@ -815,7 +868,17 @@ async function refine() {
     }
     $("planMd").value = previous;
     renderPreview(previous);
-    alert("Refine failed: " + e.message);
+    if (/api key/i.test(e.message || "")) {
+      const warnBox = $("warning");
+      warnBox.innerHTML =
+        `<div class="warn-title">Refine needs an API key — offline mode can't rewrite plans.</div>` +
+        `<div class="warn-line">Open <b>⚙️ LLM settings</b> in the left sidebar, paste your key, then Send again.</div>` +
+        `<div class="warn-actions"><button type="button" class="warn-cta" onclick="openLlmSettings()">Open LLM settings</button></div>`;
+      warnBox.classList.remove("hidden");
+      window.openLlmSettings();
+    } else {
+      alert("Refine failed: " + e.message);
+    }
   } finally {
     clearWatchdog();
     abortCtrl = null;
