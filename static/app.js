@@ -10,7 +10,55 @@ const store = {
   get apiKey() { return localStorage.getItem("planner.apiKey") || ""; },
 };
 
-// init settings
+// Unsaved draft backup so a refresh never wipes typed ideas.
+function persistDraft() {
+  try {
+    localStorage.setItem("planner.draftIdea", $("idea").value || "");
+    // Backup the plan text too — covers the window before first autosave.
+    localStorage.setItem("planner.draftPlan", $("planMd").value || "");
+    localStorage.setItem("planner.draftGoal", generatedGoal || "");
+    if (currentId) localStorage.setItem("planner.currentId", currentId);
+  } catch (_) { /* storage full/blocked — server save still works */ }
+}
+
+let autosaveTimerId = null;
+async function savePlan(opts) {
+  opts = opts || {};
+  const plan_markdown = $("planMd").value || "";
+  const raw_idea = $("idea").value || "";
+  if (!plan_markdown.trim() && !raw_idea.trim()) return null;
+  const payload = {
+    title: generatedGoal || smartTruncate(raw_idea.split("\n")[0], 220) || "Untitled",
+    raw_idea,
+    plan_markdown,
+  };
+  let res;
+  if (currentId) {
+    res = await fetch(`/api/plans/${currentId}`, {method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+  } else {
+    res = await fetch("/api/plans", {method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+  }
+  if (!res.ok) throw new Error(`Save failed (${res.status})`);
+  const saved = await res.json();
+  currentId = saved.id;
+  generatedGoal = saved.title;
+  try { localStorage.setItem("planner.currentId", currentId); } catch (_) {}
+  persistDraft();
+  $("generatedTitle").textContent = saved.title;
+  await refreshList();
+  return saved;
+}
+
+function scheduleAutosave() {
+  clearTimeout(autosaveTimerId);
+  autosaveTimerId = setTimeout(async () => {
+    if (streamingActive) return;
+    if (!$("planMd").value.trim() && !$("idea").value.trim()) return;
+    try { await savePlan({silent: true}); } catch (_) { /* keep local draft; next edit retries */ }
+  }, 800);
+}
+
+$("idea").addEventListener("input", () => { persistDraft(); });
 $("baseUrl").value = store.baseUrl;
 $("model").value = store.model;
 $("apiKey").value = store.apiKey;
@@ -231,7 +279,11 @@ $("preview").addEventListener("dblclick", () => {
   if (!streamingActive) setEditMode(true);
 });
 
-$("planMd").addEventListener("input", (e) => renderPreview(e.target.value));
+$("planMd").addEventListener("input", (e) => {
+  renderPreview(e.target.value);
+  persistDraft();
+  scheduleAutosave();
+});
 
 async function refreshList() {
   const res = await fetch("/api/plans");
@@ -256,9 +308,11 @@ async function loadPlan(id) {
   const p = await res.json();
   currentId = p.id;
   generatedGoal = p.title;
+  try { localStorage.setItem("planner.currentId", p.id); } catch (_) {}
   $("generatedTitle").textContent = p.title;
   $("idea").value = p.raw_idea || "";
   $("planMd").value = p.plan_markdown || "";
+  persistDraft();
   renderPreview(p.plan_markdown || "");
   setEditMode(false);
   $("sourceBadge").classList.add("hidden");
@@ -268,6 +322,7 @@ async function loadPlan(id) {
 
 function resetToDump() {
   if (abortCtrl) abortCtrl.abort();
+  clearTimeout(autosaveTimerId);
   currentId = null;
   generatedGoal = "";
   $("idea").value = "";
@@ -280,6 +335,12 @@ function resetToDump() {
   if ($("refineInput")) $("refineInput").value = "";
   setEditMode(false);
   showResult(false);
+  try {
+    localStorage.removeItem("planner.currentId");
+    localStorage.removeItem("planner.draftPlan");
+    localStorage.removeItem("planner.draftGoal");
+    persistDraft();
+  } catch (_) {}
   $("idea").focus();
   refreshList();
 }
@@ -452,6 +513,13 @@ async function generate() {
       else if (ev.type === "error") throw new Error(ev.error);
     }, signal);
     if (!accumulated.trim()) throw new Error("Empty response from AI.");
+    // Auto-save so a refresh never loses a generated idea.
+    persistDraft();
+    try {
+      await savePlan({silent: true});
+    } catch (saveErr) {
+      console.warn("Autosave failed, kept local draft:", saveErr);
+    }
   } catch (e) {
     if (e.name === "AbortError" || (abortCtrl && abortCtrl.signal.aborted)) {
       // Restore whatever was on screen before the aborted run.
@@ -520,6 +588,13 @@ async function refine() {
       else if (ev.type === "error") throw new Error(ev.error);
     }, signal);
     if (!accumulated.trim()) throw new Error("Empty response from AI.");
+    // Auto-save the revision so a refresh keeps it.
+    persistDraft();
+    try {
+      await savePlan({silent: true});
+    } catch (saveErr) {
+      console.warn("Autosave failed, kept local draft:", saveErr);
+    }
   } catch (e) {
     if (e.name === "AbortError" || (abortCtrl && abortCtrl.signal.aborted)) {
       if (!gotFirstDelta) {
@@ -551,22 +626,17 @@ $("refineInput").addEventListener("keydown", (e) => {
 });
 
 $("saveBtn").onclick = async () => {
-  const payload = {
-    title: generatedGoal || smartTruncate($("idea").value.split("\n")[0], 220) || "Untitled",
-    raw_idea: $("idea").value,
-    plan_markdown: $("planMd").value,
-  };
-  let res;
-  if (currentId) {
-    res = await fetch(`/api/plans/${currentId}`, {method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload)});
-  } else {
-    res = await fetch("/api/plans", {method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(payload)});
+  const btn = $("saveBtn");
+  const original = btn.textContent;
+  try {
+    await savePlan();
+    btn.textContent = "✓ Saved";
+  } catch (e) {
+    alert("Save failed: " + e.message);
+    return;
+  } finally {
+    setTimeout(() => { btn.textContent = original; }, 1500);
   }
-  const saved = await res.json();
-  currentId = saved.id;
-  generatedGoal = saved.title;
-  $("generatedTitle").textContent = saved.title;
-  await refreshList();
 };
 
 $("deleteBtn").onclick = async () => {
@@ -595,9 +665,40 @@ $("preview").addEventListener("click", (e) => {
   }
   $("planMd").value = lines.join("\n");
   renderPreview($("planMd").value);
+  persistDraft();
+  scheduleAutosave();
 });
 
-showResult(false);
-setEditMode(false);
-refreshList();
-$("idea").focus();
+async function boot() {
+  showResult(false);
+  setEditMode(false);
+  await refreshList();
+  // Restore last-open plan or unsaved draft so refresh never loses ideas.
+  let restoredId = null;
+  try { restoredId = localStorage.getItem("planner.currentId") || null; } catch (_) {}
+  if (restoredId) {
+    try {
+      await loadPlan(restoredId);
+      return;
+    } catch (_) {
+      try { localStorage.removeItem("planner.currentId"); } catch (_) {}
+    }
+  }
+  try {
+    const draftIdea = localStorage.getItem("planner.draftIdea") || "";
+    const draftPlan = localStorage.getItem("planner.draftPlan") || "";
+    const draftGoal = localStorage.getItem("planner.draftGoal") || "";
+    if (draftIdea.trim() || draftPlan.trim()) {
+      $("idea").value = draftIdea;
+      $("planMd").value = draftPlan;
+      generatedGoal = draftGoal;
+      if (draftPlan.trim()) {
+        $("generatedTitle").textContent = draftGoal || "Unsaved draft";
+        renderPreview(draftPlan);
+        showResult(true);
+      }
+    }
+  } catch (_) {}
+  $("idea").focus();
+}
+boot();
