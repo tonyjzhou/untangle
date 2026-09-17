@@ -113,6 +113,10 @@ def _docs_total_budget(model: str = "") -> int:
     m = (model or "").lower()
     if any(k in m for k in ("2m", "1m", "1000k", "1.5m")):
         return 900000
+    # Modern Gemini Flash/Pro models ship a 1M-token window but the model
+    # id (e.g. gemini-3.8-flash) carries no explicit size hint.
+    if "gemini" in m:
+        return 900000
     if "200k" in m:
         return 600000
     if "128k" in m:
@@ -762,9 +766,7 @@ def generate():
     docs_context, docs_sources, vault_error = get_docs_context(data)
     if len(idea) < 5 and not docs_context:
         return jsonify({"error": "Idea is too short — dump a bit more detail, or attach reference docs."}), 400
-    api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
-    base_url = (data.get("baseUrl") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
-    model = (data.get("model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    api_key, base_url, model = _resolve_llm(data)
 
     source = "local"
     try:
@@ -792,11 +794,49 @@ def generate():
     return jsonify(out)
 
 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_DEFAULT_MODEL = "gemini-3.8-flash"
+
+
+def _env_first(*names: str) -> str:
+    for n in names:
+        v = (os.environ.get(n) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _resolve_llm(data: dict) -> tuple:
+    """Resolve (api_key, base_url, model) from request + env.
+
+    Accepts per-request apiKey/baseUrl/model (browser localStorage) with
+    server-side env fallbacks for both OpenAI and Gemini. Gemini works
+    through its OpenAI-compatible endpoint, so no request-shape change is
+    needed — just point baseUrl at generativelanguage + use a gemini-* model.
+    """
+    data = data or {}
+    api_key = (str(data.get("apiKey") or "").strip()
+               or _env_first("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+                            "GOOGLE_GENERATIVE_AI_API_KEY", "LLM_API_KEY"))
+    base_url = (str(data.get("baseUrl") or "").strip()
+                or _env_first("OPENAI_BASE_URL", "GEMINI_BASE_URL", "GEMINI_API_BASE", "LLM_BASE_URL"))
+    model = (str(data.get("model") or "").strip()
+             or _env_first("OPENAI_MODEL", "GEMINI_MODEL", "LLM_MODEL"))
+    if not base_url:
+        # Default endpoint follows the key that is actually configured:
+        # a Gemini key alone should not default to api.openai.com.
+        if _env_first("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY") and not _env_first("OPENAI_API_KEY"):
+            base_url = GEMINI_BASE_URL
+        else:
+            base_url = "https://api.openai.com/v1"
+    if not model:
+        model = GEMINI_DEFAULT_MODEL if "generativelanguage.googleapis.com" in base_url else "gpt-4o-mini"
+    return api_key.strip(), base_url.strip(), model.strip()
+
+
 def _llm_config(data: dict):
-    api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
-    base_url = (data.get("baseUrl") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
-    model = (data.get("model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
-    return api_key, base_url, model
+    """Back-compat alias — all callers resolve via _resolve_llm."""
+    return _resolve_llm(data)
 
 
 @app.post("/api/refine")
