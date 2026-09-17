@@ -79,6 +79,8 @@ function resetToDump() {
   $("generatedTitle").textContent = "";
   $("sourceBadge").classList.add("hidden");
   $("warning").classList.add("hidden");
+  if ($("status")) $("status").classList.add("hidden");
+  if ($("refineInput")) $("refineInput").value = "";
   showResult(false);
   $("idea").focus();
   refreshList();
@@ -86,49 +88,183 @@ function resetToDump() {
 
 $("newBtn").onclick = resetToDump;
 
+let statusTimerId = null;
+let statusStartedAt = 0;
+
+function setBusy(busy, label) {
+  for (const id of ["generateBtn", "regenerateBtn", "refineBtn", "saveBtn"]) {
+    const el = $(id);
+    if (el) el.disabled = busy;
+  }
+  const btn = $("generateBtn");
+  if (btn) btn.textContent = busy ? (label || "Generating…") : "✨ Generate concrete steps";
+  const regen = $("regenerateBtn");
+  if (regen) regen.textContent = busy ? (label || "Working…") : "↻ Regenerate";
+  if (busy) $("preview").classList.add("streaming");
+  else $("preview").classList.remove("streaming");
+}
+
+function setStatus(message) {
+  $("status").classList.remove("hidden");
+  $("statusText").textContent = message;
+  statusStartedAt = Date.now();
+  $("statusTimer").textContent = "0.0s";
+  clearInterval(statusTimerId);
+  statusTimerId = setInterval(() => {
+    $("statusTimer").textContent = ((Date.now() - statusStartedAt) / 1000).toFixed(1) + "s";
+  }, 100);
+}
+
+function updateStatus(message) {
+  $("statusText").textContent = message;
+}
+
+function clearStatus() {
+  clearInterval(statusTimerId);
+  $("status").classList.add("hidden");
+}
+
+function llmPayload(extra) {
+  return {
+    apiKey: $("apiKey").value.trim(),
+    baseUrl: $("baseUrl").value.trim() || "https://api.openai.com/v1",
+    model: $("model").value.trim() || "gpt-4o-mini",
+    ...extra,
+  };
+}
+
+// POST an SSE endpoint and dispatch parsed `data:` events.
+async function streamSSE(url, payload, onEvent) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "Accept": "text/event-stream"},
+    body: JSON.stringify(payload),
+  });
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    // Non-stream response (e.g. 400 JSON error).
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `Request failed (${res.status})`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const dispatch = (raw) => {
+    for (const chunk of raw.split("\n\n")) {
+      const line = chunk.trim();
+      if (!line.startsWith("data:")) continue;
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()));
+      } catch (_) { /* ignore partial JSON */ }
+    }
+  };
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, {stream: true});
+    const idx = buf.lastIndexOf("\n\n");
+    if (idx !== -1) {
+      dispatch(buf.slice(0, idx));
+      buf = buf.slice(idx + 2);
+    }
+  }
+  if (buf.trim()) dispatch(buf);
+}
+
 async function generate() {
   const idea = $("idea").value.trim();
   if (idea.length < 5) { alert("Dump a bit more detail first."); return; }
-  const btn = $("generateBtn");
-  btn.disabled = true;
-  btn.textContent = "Generating...";
   $("warning").classList.add("hidden");
+  setBusy(true, "Generating…");
+  setStatus("Starting…");
+  showResult(true);
+  $("generatedTitle").textContent = "Drafting your plan…";
+  $("planMd").value = "";
+  renderPreview("");
+  $("resultSection").scrollIntoView({behavior: "smooth"});
+  let accumulated = "";
   try {
-    const res = await fetch("/api/generate", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
-        idea,
-        apiKey: $("apiKey").value.trim(),
-        baseUrl: $("baseUrl").value.trim() || "https://api.openai.com/v1",
-        model: $("model").value.trim() || "gpt-4o-mini",
-      }),
+    await streamSSE("/api/generate/stream", llmPayload({idea}), (ev) => {
+      if (ev.type === "status") updateStatus(ev.message);
+      else if (ev.type === "delta") {
+        accumulated += ev.text || "";
+        $("planMd").value = accumulated;
+        renderPreview(accumulated);
+      }
+      else if (ev.type === "done") {
+        accumulated = ev.markdown || accumulated;
+        generatedGoal = (ev.goal || idea.split("\n")[0]).slice(0, 80);
+        $("generatedTitle").textContent = generatedGoal;
+        $("planMd").value = accumulated;
+        renderPreview(accumulated);
+        const badge = $("sourceBadge");
+        badge.classList.remove("hidden");
+        badge.textContent = ev.source === "llm" ? "✨ AI-generated" : "📦 Offline template (add API key for AI)";
+      }
+      else if (ev.type === "error") throw new Error(ev.error);
     });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    generatedGoal = (data.plan?.goal || idea.split("\n")[0]).slice(0, 80);
-    $("generatedTitle").textContent = generatedGoal;
-    $("planMd").value = data.markdown;
-    renderPreview(data.markdown);
-    const badge = $("sourceBadge");
-    badge.classList.remove("hidden");
-    badge.textContent = data.source === "llm" ? "✨ AI-generated" : "📦 Offline template (add API key for AI)";
-    if (data.warning) {
-      $("warning").textContent = data.warning;
-      $("warning").classList.remove("hidden");
-    }
-    showResult(true);
-    $("resultSection").scrollIntoView({behavior: "smooth"});
+    if (!accumulated.trim()) throw new Error("Empty response from AI.");
   } catch (e) {
+    $("generatedTitle").textContent = generatedGoal || "Generation failed";
     alert("Generation failed: " + e.message);
   } finally {
-    btn.disabled = false;
-    btn.textContent = "✨ Generate concrete steps";
+    setBusy(false);
+    clearStatus();
+  }
+}
+
+async function refine() {
+  const instruction = $("refineInput").value.trim();
+  if (instruction.length < 3) { alert("Tell the AI what to change first."); return; }
+  if ($("planMd").value.trim().length < 10) { alert("Generate a plan first."); return; }
+  $("warning").classList.add("hidden");
+  setBusy(true, "Refining…");
+  setStatus("Refining plan…");
+  let accumulated = "";
+  const previous = $("planMd").value;
+  $("planMd").value = previous + "\n\n<!-- Refining: " + instruction.replace(/-->/g, "") + " -->";
+  try {
+    await streamSSE("/api/refine/stream", llmPayload({
+      idea: $("idea").value,
+      plan_markdown: previous,
+      instruction,
+    }), (ev) => {
+      if (ev.type === "status") updateStatus(ev.message);
+      else if (ev.type === "delta") {
+        accumulated += ev.text || "";
+        $("planMd").value = accumulated;
+        renderPreview(accumulated);
+      }
+      else if (ev.type === "done") {
+        accumulated = ev.markdown || accumulated;
+        $("planMd").value = accumulated;
+        renderPreview(accumulated);
+        if (ev.goal) {
+          generatedGoal = ev.goal.slice(0, 80);
+          $("generatedTitle").textContent = generatedGoal;
+        }
+        $("refineInput").value = "";
+        $("refineInput").placeholder = "Anything else to tweak?";
+      }
+      else if (ev.type === "error") throw new Error(ev.error);
+    });
+    if (!accumulated.trim()) throw new Error("Empty response from AI.");
+  } catch (e) {
+    $("planMd").value = previous;
+    renderPreview(previous);
+    alert("Refine failed: " + e.message);
+  } finally {
+    setBusy(false);
+    clearStatus();
   }
 }
 
 $("generateBtn").onclick = generate;
 $("regenerateBtn").onclick = generate;
+$("refineBtn").onclick = refine;
+$("refineInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); refine(); }
+});
 
 $("saveBtn").onclick = async () => {
   const payload = {

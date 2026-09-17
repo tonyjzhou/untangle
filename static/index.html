@@ -44,6 +44,19 @@
         <button id="saveBtn">💾 Save</button>
         <button id="deleteBtn" class="danger">Delete</button>
       </div>
+      <div id="status" class="status hidden" role="status" aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="statusText">Working…</span>
+        <span id="statusTimer" class="status-timer"></span>
+      </div>
+      <div class="refine-box">
+        <label class="section-label" for="refineInput">Ask AI to adjust the plan:</label>
+        <div class="refine-row">
+          <input id="refineInput" placeholder="e.g. Make phase 2 cheaper and solo-friendly, add timelines…" />
+          <button id="refineBtn">Send</button>
+        </div>
+        <p class="hint">Refine keeps your checked boxes where possible. Needs an API key; offline mode can't rewrite.</p>
+      </div>
       <label class="section-label">Plan (editable Markdown, checkboxes persist):</label>
       <div class="editor-grid">
         <textarea id="planMd" placeholder="Your concrete steps will appear here..."></textarea>

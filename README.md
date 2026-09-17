@@ -41,6 +41,9 @@ Or per-request from the UI sidebar (⚙️ LLM settings) — stored only in your
 ## API
 
 - `POST /api/generate` `{idea, apiKey?, baseUrl?, model?}` → `{plan, markdown, source}`
+- `POST /api/generate/stream` (SSE) same input → `status` / `delta` / `done` events, plan streams in live so Regenerate never sits silent
+- `POST /api/refine` `{idea, plan_markdown, instruction, apiKey?, baseUrl?, model?}` → `{markdown, goal, source}` (needs API key)
+- `POST /api/refine/stream` (SSE) same input → live-refines the plan from a follow-up prompt
 - `GET /api/plans` → list `{id, title, created, updated}`
 - `POST /api/plans` `{title, raw_idea, plan_markdown}` → saved plan
 - `GET /api/plans/<id>` → `{id, title, raw_idea, plan_markdown, ...}`

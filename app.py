@@ -6,7 +6,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
 
 BASE_DIR = Path(__file__).parent
 PLANS_DIR = BASE_DIR / "plans"
@@ -142,6 +142,43 @@ def local_fallback_plan(idea: str) -> dict:
     }
 
 
+REFINE_SYSTEM_PROMPT = """You are a pragmatic planning assistant revising an existing plan.
+The user has a raw idea, a current plan in Markdown, and a follow-up instruction
+(e.g. "make phase 2 cheaper", "add timelines", "focus on solo founder").
+
+Rules:
+- Apply the instruction while keeping what still works. Preserve checkbox lines
+  ("- [ ]" / "- [x]") including their checked state unless the step itself changes.
+- Keep the same Markdown shape as the current plan: ## Plan, **Goal:** line,
+  ### Phase N: ... sections with "- [ ] Step `[S|M|L/P1|P2|P3]`" lines,
+  then ### Success criteria, ### Risks, ### Do next (today).
+- Keep total steps between 7 and 15. Start each step with a verb. Be specific.
+- Return Markdown only, no JSON, no code fences, no commentary.
+"""
+
+STREAM_SYSTEM_PROMPT = """You are a pragmatic planning assistant. The user dumps a raw, messy idea.
+Turn it into a concrete, actionable plan. Output Markdown ONLY (no JSON, no code fences).
+
+Exact shape:
+## Plan
+
+**Goal:** <one clear sentence>
+
+### Phase 1: <name>
+- [ ] <step starting with a verb> `[S|M|L/P1|P2|P3]`
+... (3-5 phases, 7-15 steps total, each step doable in <=2h)
+
+### Success criteria
+- [ ] <3 measurable checks>
+
+### Risks
+- <2-3 risks>
+
+### Do next (today)
+- [ ] <3 immediate actions>
+"""
+
+
 def call_llm(idea: str, api_key: str, base_url: str, model: str) -> dict:
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -163,6 +200,75 @@ def call_llm(idea: str, api_key: str, base_url: str, model: str) -> dict:
         body = json.loads(resp.read().decode())
     content = body["choices"][0]["message"]["content"]
     return json.loads(content)
+
+
+def call_llm_markdown(messages: list, api_key: str, base_url: str, model: str, timeout: int = 60) -> str:
+    """Non-streaming Markdown-mode call (used by refine + stream fallback)."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {"model": model, "messages": messages, "temperature": 0.7}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode())
+    content = body["choices"][0]["message"]["content"] or ""
+    return content.strip().strip("`").strip()
+
+
+def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model: str, timeout: int = 90):
+    """Yield text deltas from an OpenAI-compatible streaming chat completion."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {"model": model, "messages": messages, "temperature": 0.7, "stream": True}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        buf = b""
+        while True:
+            chunk = resp.read(1024)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    return
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                try:
+                    delta = obj["choices"][0]["delta"].get("content", "")
+                except Exception:
+                    delta = ""
+                if delta:
+                    yield delta
+
+
+def extract_goal_from_markdown(markdown: str, fallback: str) -> str:
+    m = re.search(r"\*\*Goal:\*\*\s*(.+)", markdown)
+    if m:
+        return m.group(1).strip()[:120]
+    first = (fallback.strip().splitlines() or ["Untitled"])[0][:120]
+    return first
+
+
+def sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
 
 @app.get("/")
@@ -253,6 +359,132 @@ def generate():
             "warning": f"LLM call failed, used offline plan instead: {e}",
         })
     return jsonify({"plan": plan_json, "markdown": json_to_markdown(plan_json), "source": source})
+
+
+def _llm_config(data: dict):
+    api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
+    base_url = (data.get("baseUrl") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+    model = (data.get("model") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    return api_key, base_url, model
+
+
+@app.post("/api/refine")
+def refine():
+    """Iteratively adjust an existing plan with a natural-language instruction."""
+    data = request.get_json(force=True)
+    idea = (data.get("idea") or "").strip()
+    plan_markdown = (data.get("plan_markdown") or data.get("planMarkdown") or "").strip()
+    instruction = (data.get("instruction") or "").strip()
+    if len(instruction) < 3:
+        return jsonify({"error": "Tell the AI what to change (e.g. 'make it cheaper')."}), 400
+    if len(plan_markdown) < 10:
+        return jsonify({"error": "No plan to refine yet — generate one first."}), 400
+    api_key, base_url, model = _llm_config(data)
+    if not api_key:
+        return jsonify({
+            "markdown": plan_markdown,
+            "source": "local",
+            "warning": "Refine needs an API key — offline mode can't rewrite plans. Add a key in LLM settings.",
+        })
+    messages = [
+        {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+        {"role": "user", "content": f"Original idea:\n{idea}\n\nCurrent plan:\n{plan_markdown}\n\nChange request:\n{instruction}\n\nReturn the full revised plan as Markdown only."},
+    ]
+    try:
+        markdown = call_llm_markdown(messages, api_key, base_url, model)
+    except Exception as e:
+        return jsonify({"error": f"LLM refine failed: {e}"}), 502
+    goal = extract_goal_from_markdown(markdown, idea)
+    return jsonify({"markdown": markdown, "goal": goal, "source": "llm"})
+
+
+def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
+    """Shared SSE streamer. messages_fn(api_key, base_url, model) -> messages or None for offline."""
+    import time
+
+    data = request.get_json(force=True)
+    idea_val = (data.get("idea") or idea or "").strip()
+    api_key, base_url, model = _llm_config(data)
+
+    def gen():
+        yield sse({"type": "status", "message": "Contacting AI…"})
+        if not api_key:
+            yield sse({"type": "status", "message": "No API key — building offline plan…"})
+            md = json_to_markdown(local_fallback_plan(idea_val or "Untitled"))
+            # Chunk the offline plan so the UI still streams instead of popping in.
+            for i in range(0, len(md), 200):
+                yield sse({"type": "delta", "text": md[i:i + 200]})
+                time.sleep(0.02)
+            yield sse({"type": "done", "markdown": md,
+                       "goal": extract_goal_from_markdown(md, idea_val),
+                       "source": "local"})
+            return
+        messages = messages_fn(data)
+        yield sse({"type": "status", "message": "AI is drafting your plan — streaming…"})
+        full = []
+        try:
+            for delta in iter_llm_markdown_stream(messages, api_key, base_url, model):
+                full.append(delta)
+                yield sse({"type": "delta", "text": delta})
+        except Exception:
+            # Streaming not supported by this provider — fall back to one-shot call.
+            yield sse({"type": "status", "message": "Live stream unavailable — fetching full plan…"})
+            try:
+                full_text = call_llm_markdown(messages, api_key, base_url, model)
+            except Exception as e:
+                yield sse({"type": "error", "error": f"LLM call failed: {e}"})
+                return
+            yield sse({"type": "delta", "text": full_text})
+            full = [full_text]
+        markdown = "".join(full).strip()
+        yield sse({"type": "done", "markdown": markdown,
+                   "goal": extract_goal_from_markdown(markdown, idea_val),
+                   "source": "llm"})
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/generate/stream")
+def generate_stream():
+    data = request.get_json(force=True, silent=True) or {}
+    idea = (data.get("idea") or "").strip()
+    if len(idea) < 5:
+        return jsonify({"error": "Idea is too short — dump a bit more detail."}), 400
+
+    def messages_fn(_data):
+        return [
+            {"role": "system", "content": STREAM_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Idea dump:\n{idea}"},
+        ]
+
+    return _stream_markdown_response(messages_fn, idea)
+
+
+@app.post("/api/refine/stream")
+def refine_stream():
+    data = request.get_json(force=True, silent=True) or {}
+    instruction = (data.get("instruction") or "").strip()
+    plan_markdown = (data.get("plan_markdown") or data.get("planMarkdown") or "").strip()
+    idea = (data.get("idea") or "").strip()
+    if len(instruction) < 3:
+        return jsonify({"error": "Tell the AI what to change."}), 400
+    if len(plan_markdown) < 10:
+        return jsonify({"error": "No plan to refine yet."}), 400
+    api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        return jsonify({"error": "Refine needs an API key (offline mode can't rewrite plans)."}), 400
+
+    def messages_fn(_data):
+        return [
+            {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"Original idea:\n{idea}\n\nCurrent plan:\n{plan_markdown}\n\n"
+                f"Change request:\n{instruction}\n\nReturn the full revised plan as Markdown only."
+            )},
+        ]
+
+    return _stream_markdown_response(messages_fn, idea)
 
 
 if __name__ == "__main__":
