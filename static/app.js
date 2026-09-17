@@ -549,6 +549,7 @@ async function handleDocsFiles(input) {
   }
   input.value = "";
   renderDocsChips();
+  clearIdeas(); // docs changed — any ranked list is stale
 }
 
 async function scanVault(silent) {
@@ -598,7 +599,69 @@ function clearDocs() {
   if ($("docsPath")) $("docsPath").value = "";
   try { localStorage.removeItem("planner.docsPath"); } catch (_) {}
   renderDocsChips();
+  clearIdeas();
 }
+
+let extractedIdeas = [];
+
+function clearIdeas() {
+  extractedIdeas = [];
+  if ($("ideasList")) $("ideasList").innerHTML = "";
+  if ($("ideasStatus")) $("ideasStatus").textContent = "";
+}
+
+async function extractIdeas() {
+  if (streamingActive) return;
+  if (!hasDocs()) { alert("Attach files or scan a folder first."); return; }
+  const btn = $("ideasBtn");
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Mining…";
+  $("ideasStatus").textContent = "Reading docs + ranking…";
+  try {
+    const res = await fetch("/api/ideas/extract", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(llmPayload({}))});
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Extract failed (${res.status})`);
+    extractedIdeas = Array.isArray(data.ideas) ? data.ideas : [];
+    renderIdeas();
+    $("ideasStatus").textContent = extractedIdeas.length
+      ? `${extractedIdeas.length} ideas from ${data.docs_count ?? "?"} docs — best first. Pick one to plan it.`
+      : "No executable ideas found in these docs.";
+    if (data.warning) $("ideasStatus").textContent += ` (${data.warning})`;
+  } catch (e) {
+    if (/api key/i.test(e.message || "")) window.openLlmSettings();
+    $("ideasStatus").textContent = "Extract failed: " + (e.message || e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function renderIdeas() {
+  const wrap = $("ideasList");
+  if (!wrap) return;
+  if (!extractedIdeas.length) { wrap.innerHTML = ""; return; }
+  wrap.innerHTML = extractedIdeas.map((idea, i) => {
+    const effort = String(idea.effort || "M").toUpperCase();
+    const stars = "★".repeat(Math.max(0, Math.min(5, idea.impact || 0))) || "–";
+    const srcs = (idea.sources || []).slice(0, 3).map(escHtml).join(", ");
+    return `<div class="idea-item">`
+      + `<div class="idea-head"><span class="idea-rank">${i + 1}</span><span class="idea-title">${escHtml(idea.title || "Untitled")}</span></div>`
+      + (idea.summary ? `<div class="idea-summary">${escHtml(idea.summary)}</div>` : "")
+      + (idea.rationale ? `<div class="idea-why">Why #${i + 1}: ${escHtml(idea.rationale)}</div>` : "")
+      + `<div class="idea-meta">${pillHtml(effort, null)}<span class="idea-impact" title="Impact (1-5)">${escHtml(stars)}</span>${srcs ? `<span class="idea-src">📄 ${srcs}</span>` : ""}</div>`
+      + `<button type="button" data-plan-idea="${i}">Plan this →</button>`
+      + `</div>`;
+  }).join("");
+}
+
+window.planIdea = function(i) {
+  const idea = extractedIdeas[i];
+  if (!idea || streamingActive) return;
+  $("idea").value = `${idea.title || ""}\n\n${idea.summary || ""}`.trim();
+  persistDraft();
+  generate();
+};
 
 // POST an SSE endpoint and dispatch parsed `data:` events.
 async function streamSSE(url, payload, onEvent, signal) {
@@ -913,6 +976,11 @@ $("cancelBtn").onclick = () => { if (abortCtrl) abortCtrl.abort(); };
 if ($("docsFiles")) $("docsFiles").addEventListener("change", (e) => handleDocsFiles(e.target));
 if ($("docsScanBtn")) $("docsScanBtn").onclick = () => scanVault(false);
 if ($("docsClearBtn")) $("docsClearBtn").onclick = clearDocs;
+if ($("ideasBtn")) $("ideasBtn").onclick = extractIdeas;
+if ($("ideasList")) $("ideasList").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-plan-idea]");
+  if (b) window.planIdea(parseInt(b.dataset.planIdea, 10));
+});
 if ($("docsPath")) $("docsPath").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); scanVault(false); }
 });
@@ -925,6 +993,7 @@ if ($("docsPath")) $("docsPath").addEventListener("change", () => {
     else localStorage.removeItem("planner.docsPath");
   } catch (_) {}
   renderDocsChips();
+  clearIdeas(); // path changed — any ranked list is stale
 });
 $("refineInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); refine(); }

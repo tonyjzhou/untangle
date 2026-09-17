@@ -30,7 +30,7 @@
       <textarea id="idea" placeholder="Just brain-dump everything: what, why, for whom, constraints, half-thoughts...&#10;&#10;Example: I want to start a weekly newsletter about indie hackers in Berlin, monetize later with sponsorships, I have 3h/week..."></textarea>
       <div class="docs-box">
         <label class="section-label" for="docsPath">📚 Reference docs (optional) — mine ideas from your notes</label>
-        <p class="hint">Attach <code>.md</code> / <code>.txt</code> files or point at a local folder (e.g. an Obsidian vault). The AI grounds the plan in them — or leave the idea empty and it will extract the best executable idea from them.</p>
+        <p class="hint">Attach <code>.md</code> / <code>.txt</code> files or point at a local folder (e.g. an Obsidian vault). The AI grounds the plan in them — or hit 💡 Extract ideas to list + rank everything first, then plan one.</p>
         <div class="docs-row">
           <label class="file-btn" for="docsFiles">📎 Attach files<input id="docsFiles" type="file" multiple accept=".md,.markdown,.txt,text/markdown,text/plain" class="hidden" /></label>
           <input id="docsPath" placeholder="/Users/you/Documents/obsidian-vault  (folder must be on this machine)" />
@@ -39,6 +39,11 @@
         </div>
         <div id="docsStatus" class="hint" aria-live="polite"></div>
         <div id="docsChips" class="docs-chips"></div>
+        <div class="docs-row">
+          <button id="ideasBtn" type="button">💡 Extract ideas</button>
+          <span class="hint" id="ideasStatus" aria-live="polite"></span>
+        </div>
+        <div id="ideasList" class="ideas-list"></div>
       </div>
       <div class="hero-actions">
         <button id="generateBtn" class="primary big">✨ Generate concrete steps</button>

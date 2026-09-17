@@ -154,6 +154,33 @@ def _relevance_score(query_tokens: set, rel_path: str, head: str) -> int:
     return 3 * name_hit + head_hit
 
 
+def _diversify_candidates(candidates: list) -> list:
+    """Round-robin interleave of candidates grouped by top-level dir.
+
+    Used when there is no query (plain scan / extract mode): every score is
+    0, so pure alphabetical order would fill the budget from a single run of
+    files. Interleaving spreads the budgeted slice across the whole vault.
+    Deterministic: groups sorted biggest-first, files alphabetical within.
+    """
+    groups: dict = {}
+    for c in sorted(candidates, key=lambda c: c["name"]):
+        top = c["name"].split("/", 1)[0] if "/" in c["name"] else "(root)"
+        groups.setdefault(top, []).append(c)
+    ordered = sorted(groups.values(), key=lambda g: (-len(g), g[0]["name"]))
+    out = []
+    i = 0
+    while True:
+        progressed = False
+        for g in ordered:
+            if i < len(g):
+                out.append(g[i])
+                progressed = True
+        if not progressed:
+            break
+        i += 1
+    return out
+
+
 def _is_allowed_doc(path: Path) -> bool:
     if path.suffix.lower() not in DOCS_ALLOWED_EXTS:
         return False
@@ -165,7 +192,8 @@ def read_docs_dir(dirpath: str, query: str = "", budget=None, per_file_cap=None,
 
     Every matching file (up to max_files) is *considered*: files are read in
     batches, scored against `query`, and the most relevant slice fitting
-    `budget` chars is returned as `combined`. A 5000-file vault works — the
+    `budget` chars is returned as `combined`. With no query the slice is
+    diversified across top-level folders instead of alphabetical. A 5000-file vault works — the
     plan is grounded in the most relevant subset. `total_files` is how many
     files were found; `files` is the included subset.
     """
@@ -204,7 +232,12 @@ def read_docs_dir(dirpath: str, query: str = "", budget=None, per_file_cap=None,
             rel = str(p.relative_to(base))
             score = _relevance_score(q_tokens, rel, text[:8000])
             candidates.append({"name": rel, "text": text, "score": score, "cut": cut})
-    candidates.sort(key=lambda c: (-c["score"], c["name"]))
+    if q_tokens:
+        candidates.sort(key=lambda c: (-c["score"], c["name"]))
+    else:
+        # No query (plain scan / extract mode): diversify so the budgeted
+        # slice spans the vault instead of one alphabetical run.
+        candidates = _diversify_candidates(candidates)
     files_out = []
     combined_parts = []
     total_chars = 0
@@ -757,6 +790,108 @@ def scan_docs():
         "budget": result["budget"],
         "query_ranked": result["query_ranked"],
     })
+
+
+EXTRACT_IDEAS_SYSTEM_PROMPT = """You mine a user's personal notes for executable ideas — things they could DO (projects, products, habits, content, life ops), not summaries of what they read.
+
+Rules:
+- List distinct, non-overlapping ideas. Merge near-duplicates into one.
+- Each idea needs a 1-sentence title (max 15 words) and a 1-2 sentence summary of what doing it means.
+- Rank best-first using common-sense judgment: concrete and scoped over vague; executable by one person; high leverage for the effort; reversible / low downside; recurring themes across many notes beat one-off mentions.
+- Add a 1-sentence rationale per idea saying WHY it ranks there.
+- Name up to 3 source files per idea from the docs.
+- Skip pure reference material (book notes with no action, reading lists) unless a clear action falls out of them.
+- Max 12 ideas. Fewer is fine if fewer are real.
+
+Return JSON only with this shape:
+{"ideas": [{"title": "...", "summary": "...", "rationale": "...", "effort": "S|M|L", "impact": 1-5, "sources": ["file.md"]}]}
+"""
+
+IDEAS_MAX = 12
+
+
+def _parse_ideas_json(content: str) -> list:
+    """Parse + validate the extract-ideas JSON payload."""
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```\w*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    try:
+        obj = json.loads(text)
+    except Exception as e:
+        raise ValueError(f"could not parse ideas JSON: {e}")
+    raw = obj.get("ideas") if isinstance(obj, dict) else None
+    if not isinstance(raw, list):
+        raise ValueError("ideas JSON has no 'ideas' list")
+    clean = []
+    for item in raw[:IDEAS_MAX]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        try:
+            impact = int(item.get("impact") or 0)
+        except (TypeError, ValueError):
+            impact = 0
+        sources = item.get("sources") or []
+        clean.append({
+            "title": smart_truncate(title, 120),
+            "summary": smart_truncate(str(item.get("summary") or ""), 300),
+            "rationale": smart_truncate(str(item.get("rationale") or ""), 200),
+            "effort": str(item.get("effort") or "M").strip().upper()[:1] or "M",
+            "impact": max(0, min(5, impact)),
+            "sources": [str(s)[:120] for s in sources if str(s).strip()][:3],
+        })
+    return clean
+
+
+def extract_ideas_from_docs(docs_context: str, api_key: str, base_url: str, model: str) -> list:
+    """One-shot JSON call: list + rank every executable idea in the docs."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": EXTRACT_IDEAS_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Reference docs:\n{docs_context}"},
+        ],
+        "temperature": 0.5,
+        "response_format": {"type": "json_object"},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.loads(resp.read().decode())
+    content = body["choices"][0]["message"]["content"] or ""
+    return _parse_ideas_json(content)
+
+
+@app.post("/api/ideas/extract")
+def extract_ideas():
+    """Mine reference docs for a ranked shortlist of executable ideas.
+
+    Step 1 of extract-then-plan: returns ideas best-first. The UI lets the
+    user pick one, which then goes through the normal generate flow.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    docs_context, docs_sources, vault_error = get_docs_context(data)
+    if not docs_context:
+        return jsonify({"error": "Attach files or scan a folder first — there's nothing to mine."}), 400
+    api_key, base_url, model = _resolve_llm(data)
+    if not api_key:
+        return jsonify({"error": "Extract needs an API key — offline mode can't mine docs. Open ⚙️ LLM settings and add a key."}), 400
+    try:
+        ideas = extract_ideas_from_docs(docs_context, api_key, base_url, model)
+    except Exception as e:
+        return jsonify({"error": f"LLM extract failed: {e}"}), 502
+    out: dict = {"ideas": ideas, "docs_count": len(docs_sources)}
+    if vault_error:
+        out["warning"] = f"Reference folder could not be read ({vault_error}) — mined uploads only."
+    return jsonify(out)
 
 
 @app.post("/api/generate")
