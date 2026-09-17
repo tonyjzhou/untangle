@@ -14,7 +14,7 @@ Dump a messy idea, get a concrete plan.
 With reference docs attached, the AI grounds the plan in your notes — preferring their details and terminology. With an empty idea + docs, it switches to extract mode: it surfaces the best executable idea lurking in your docs and plans that.
 
 Two generation modes:
-- **AI mode** — provide any OpenAI-compatible API key + base URL + model (key stays in browser `localStorage`, or set `OPENAI_API_KEY` env var server-side)
+- **AI mode** — paste a Gemini API key + pick a `gemini-*` model (key stays in browser `localStorage`, or set `GEMINI_API_KEY` env var server-side)
 - **Offline mode** — no key needed, uses a built-in rule-based template so the app works out of the box
 
 ## Quickstart
@@ -34,28 +34,22 @@ PORT=5001 .venv/bin/python app.py
 
 Env vars (optional):
 
-- `OPENAI_API_KEY` — server-side default key (OpenAI)
-- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — server-side default key for Google Gemini
-- `OPENAI_BASE_URL` — default `https://api.openai.com/v1`
-- `GEMINI_BASE_URL` — defaults to `https://generativelanguage.googleapis.com/v1beta/openai/`
-- `OPENAI_MODEL` — default `gpt-4o-mini`
-- `GEMINI_MODEL` — default `gemini-3.8-flash` (used when the base URL is Gemini's)
+- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — server-side default key
+- `GEMINI_MODEL` — default `gemini-3.8-flash`
 - `PORT` — default `5001`
 
 Or per-request from the UI sidebar (⚙️ LLM settings) — stored only in your browser.
 
-### Use Gemini 3.8 Flash
+### Get a Gemini key
 
-1. Get a key at Google AI Studio (`aistudio.google.com`) → **Get API key**.
-2. In the sidebar open ⚙️ **LLM settings** → Provider → **Google Gemini**.
-   Base URL auto-fills to `https://generativelanguage.googleapis.com/v1beta/openai/`
-   and Model to `gemini-3.8-flash`.
-3. Paste the `AIza...` key → Generate. The key stays in `localStorage`;
-   server-side you can instead set `GEMINI_API_KEY` in `.env`.
+1. Go to Google AI Studio (`aistudio.google.com`) → **Get API key**.
+2. Paste the `AIza...` key into ⚙️ **LLM settings** → Generate.
+   The key stays in `localStorage`; server-side you can instead set
+   `GEMINI_API_KEY` in `.env`.
 
-Gemini works through its OpenAI-compatible `/chat/completions` endpoint
-(including streaming), so no backend change is needed — the app also sizes
-the reference-docs budget to Gemini's 1M-token window (~900k chars).
+Gemini is called through its OpenAI-compatible `/chat/completions` endpoint
+(including streaming) — the app also sizes the reference-docs budget to
+Gemini's 1M-token window (~900k chars).
 
 ## API
 

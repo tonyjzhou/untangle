@@ -809,28 +809,21 @@ def _env_first(*names: str) -> str:
 def _resolve_llm(data: dict) -> tuple:
     """Resolve (api_key, base_url, model) from request + env.
 
-    Accepts per-request apiKey/baseUrl/model (browser localStorage) with
-    server-side env fallbacks for both OpenAI and Gemini. Gemini works
-    through its OpenAI-compatible endpoint, so no request-shape change is
-    needed — just point baseUrl at generativelanguage + use a gemini-* model.
+    Gemini-only: the endpoint defaults to Gemini's OpenAI-compatible route
+    and the model to gemini-3.8-flash. An explicit per-request baseUrl/model
+    still wins when present (forward-compat), but the UI no longer exposes
+    other providers.
     """
     data = data or {}
     api_key = (str(data.get("apiKey") or "").strip()
-               or _env_first("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+               or _env_first("GEMINI_API_KEY", "GOOGLE_API_KEY",
                             "GOOGLE_GENERATIVE_AI_API_KEY", "LLM_API_KEY"))
     base_url = (str(data.get("baseUrl") or "").strip()
-                or _env_first("OPENAI_BASE_URL", "GEMINI_BASE_URL", "GEMINI_API_BASE", "LLM_BASE_URL"))
+                or _env_first("GEMINI_BASE_URL", "GEMINI_API_BASE", "LLM_BASE_URL")
+                or GEMINI_BASE_URL)
     model = (str(data.get("model") or "").strip()
-             or _env_first("OPENAI_MODEL", "GEMINI_MODEL", "LLM_MODEL"))
-    if not base_url:
-        # Default endpoint follows the key that is actually configured:
-        # a Gemini key alone should not default to api.openai.com.
-        if _env_first("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY") and not _env_first("OPENAI_API_KEY"):
-            base_url = GEMINI_BASE_URL
-        else:
-            base_url = "https://api.openai.com/v1"
-    if not model:
-        model = GEMINI_DEFAULT_MODEL if "generativelanguage.googleapis.com" in base_url else "gpt-4o-mini"
+             or _env_first("GEMINI_MODEL", "LLM_MODEL")
+             or GEMINI_DEFAULT_MODEL)
     return api_key.strip(), base_url.strip(), model.strip()
 
 
@@ -979,7 +972,7 @@ def refine_stream():
         return jsonify({"error": "Tell the AI what to change."}), 400
     if len(plan_markdown) < 10:
         return jsonify({"error": "No plan to refine yet."}), 400
-    api_key = (data.get("apiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
+    api_key, _, _ = _resolve_llm(data)
     if not api_key:
         return jsonify({"error": "Refine needs an API key (offline mode can't rewrite plans). Open ⚙️ LLM settings in the left sidebar and add a key."}), 400
 

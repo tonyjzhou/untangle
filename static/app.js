@@ -11,70 +11,12 @@ let vaultFiles = [];
 const DOCS_PER_FILE_LIMIT = 20000;
 const DOCS_TOTAL_LIMIT = 400000;
 
-const LLM_PRESETS = {
-  openai: {
-    label: "OpenAI",
-    baseUrl: "https://api.openai.com/v1",
-    model: "gpt-4o-mini",
-    keyPlaceholder: "sk-... (blank = offline mode)",
-    hint: "Key stays in your browser (localStorage). No key = offline template plan. Get a key at platform.openai.com.",
-  },
-  gemini: {
-    label: "Google Gemini",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/",
-    model: "gemini-3.8-flash",
-    keyPlaceholder: "AIza... from Google AI Studio (blank = offline mode)",
-    hint: "Paste a Gemini API key from Google AI Studio (aistudio.google.com). Uses Gemini's OpenAI-compatible endpoint — no backend change needed.",
-  },
-  ollama: {
-    label: "Ollama (local)",
-    baseUrl: "http://localhost:11434/v1",
-    model: "llama3.1",
-    keyPlaceholder: "ollama (any value works)",
-    hint: "Local Ollama needs no real key — type anything (e.g. 'ollama'). Run `ollama serve` + `ollama pull llama3.1` first.",
-  },
-  custom: {
-    label: "Custom",
-    baseUrl: "",
-    model: "",
-    keyPlaceholder: "sk-... (blank = offline mode)",
-    hint: "Any OpenAI-compatible API (OpenRouter, vLLM, LM Studio, ...). Base URL + /chat/completions must accept {model, messages}.",
-  },
-};
-
-function inferProvider(baseUrl, model) {
-  const b = (baseUrl || "").toLowerCase();
-  if (b.includes("generativelanguage.googleapis.com")) return "gemini";
-  if (b.includes("localhost:11434") || b.includes("127.0.0.1:11434")) return "ollama";
-  if (!b || b.includes("api.openai.com")) {
-    // Empty = OpenAI defaults, unless the model is clearly a Gemini one.
-    if ((model || "").toLowerCase().startsWith("gemini")) return "gemini";
-    return "openai";
-  }
-  return "custom";
-}
-
-function applyProvider(name, opts) {
-  opts = opts || {};
-  const p = LLM_PRESETS[name] || LLM_PRESETS.custom;
-  if (opts.fill !== false && name !== "custom") {
-    $("baseUrl").value = p.baseUrl;
-    $("model").value = p.model;
-    try {
-      localStorage.setItem("planner.baseUrl", p.baseUrl);
-      localStorage.setItem("planner.model", p.model);
-    } catch (_) {}
-  }
-  $("baseUrl").placeholder = p.baseUrl || "https://.../v1";
-  $("model").placeholder = p.model || "model-id";
-  $("apiKey").placeholder = p.keyPlaceholder;
-  if ($("providerHint")) $("providerHint").textContent = p.hint;
-  try { localStorage.setItem("planner.provider", name); } catch (_) {}
-}
+// Gemini-only LLM settings. The endpoint is fixed (Gemini's OpenAI-compatible
+// route); only the model + API key are user-configurable.
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
+const GEMINI_DEFAULT_MODEL = "gemini-3.8-flash";
 
 const store = {
-  get provider() { return localStorage.getItem("planner.provider") || ""; },
-  get baseUrl() { return localStorage.getItem("planner.baseUrl") || ""; },
   get model() { return localStorage.getItem("planner.model") || ""; },
   get apiKey() { return localStorage.getItem("planner.apiKey") || ""; },
 };
@@ -128,36 +70,25 @@ function scheduleAutosave() {
 }
 
 $("idea").addEventListener("input", () => { persistDraft(); });
-// Provider-aware LLM settings init. Existing users have no stored provider,
-// so infer it from their saved baseUrl/model (Gemini URLs -> gemini, etc.).
-$("baseUrl").value = store.baseUrl;
-$("model").value = store.model;
-$("apiKey").value = store.apiKey;
-(function initProvider() {
-  const sel = $("provider");
-  if (!sel) return;
-  let name = store.provider;
-  if (!name || !LLM_PRESETS[name]) name = inferProvider(store.baseUrl, store.model);
-  sel.value = name;
-  applyProvider(name, {fill: false});
-  // First run with no saved values: fill preset defaults so
-  // "Gemini 3.8 flash" works with one click.
-  if (!store.baseUrl && !store.model) applyProvider(name);
-  sel.addEventListener("change", () => applyProvider(sel.value));
+// Gemini-only init. Migrates multi-provider leftovers: stale baseUrl/provider
+// keys are dropped, and a non-Gemini model (e.g. gpt-4o-mini) resets to the
+// Gemini default since it would fail against the Gemini endpoint.
+(function initLlmSettings() {
+  let savedModel = (store.model || "").trim();
+  if (!savedModel.toLowerCase().startsWith("gemini")) {
+    savedModel = GEMINI_DEFAULT_MODEL;
+    try { localStorage.setItem("planner.model", savedModel); } catch (_) {}
+  }
+  try {
+    localStorage.removeItem("planner.baseUrl");
+    localStorage.removeItem("planner.provider");
+  } catch (_) {}
+  $("model").value = savedModel;
+  $("apiKey").value = store.apiKey;
 })();
-for (const [id, key] of [["baseUrl","planner.baseUrl"],["model","planner.model"],["apiKey","planner.apiKey"]]) {
+for (const [id, key] of [["model","planner.model"],["apiKey","planner.apiKey"]]) {
   $(id).addEventListener("input", (e) => {
     try { localStorage.setItem(key, e.target.value.trim()); } catch (_) {}
-    // Manual URL/model edits that no longer match the selected preset
-    // flip the dropdown to Custom so the UI never lies about the provider.
-    const sel = $("provider");
-    if (sel && (id === "baseUrl" || id === "model")) {
-      const cur = inferProvider($("baseUrl").value.trim(), $("model").value.trim());
-      if (sel.value !== "custom" && cur !== sel.value) {
-        sel.value = "custom";
-        applyProvider("custom", {fill: false});
-      }
-    }
   });
 }
 
@@ -522,12 +453,10 @@ function clearStatus() {
 }
 
 function llmPayload(extra) {
-  const sel = $("provider");
-  const preset = (sel && LLM_PRESETS[sel.value]) || LLM_PRESETS.openai;
   return {
     apiKey: $("apiKey").value.trim(),
-    baseUrl: $("baseUrl").value.trim() || preset.baseUrl,
-    model: $("model").value.trim() || preset.model,
+    baseUrl: GEMINI_BASE_URL,
+    model: $("model").value.trim() || GEMINI_DEFAULT_MODEL,
     docs: attachedDocs,
     docsPath: vaultPath,
     ...extra,
@@ -828,7 +757,7 @@ async function generate() {
             grounded +
             `<div class="warn-line">To get an AI plan grounded in your docs:</div>` +
             `<ol class="warn-steps"><li>Open <b>⚙️ LLM settings</b> in the left sidebar</li>` +
-            `<li>Paste your <b>API key</b> (Base URL + Model are prefilled for OpenAI; any OpenAI-compatible API works)</li>` +
+            `<li>Paste your <b>Gemini API key</b> (free at Google AI Studio — aistudio.google.com)</li>` +
             `<li>Hit <b>↻ Regenerate</b></li></ol>` +
             `<div class="warn-actions"><button type="button" class="warn-cta" onclick="openLlmSettings()">Open LLM settings</button>` +
             `<span class="hint">Key stays in your browser (localStorage).</span></div>`;
