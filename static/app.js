@@ -349,7 +349,11 @@ $("newBtn").onclick = resetToDump;
 
 let statusTimerId = null;
 let statusStartedAt = 0;
+let statusBase = "Working…";
+let lastProgressAt = 0;
 let abortCtrl = null;
+let watchdogId = null;
+let autoStopped = false;
 
 function setBusy(busy, label) {
   // Only block (re)generation + refine. Keep Save / Delete / New / sidebar
@@ -388,6 +392,8 @@ function showSkeleton() {
 
 function setStatus(message) {
   $("status").classList.remove("hidden");
+  statusBase = message;
+  lastProgressAt = Date.now();
   $("statusText").textContent = message;
   if ($("statusChars")) $("statusChars").textContent = "";
   statusStartedAt = Date.now();
@@ -395,12 +401,24 @@ function setStatus(message) {
   clearInterval(statusTimerId);
   statusTimerId = setInterval(() => {
     $("statusTimer").textContent = ((Date.now() - statusStartedAt) / 1000).toFixed(1) + "s";
+    // Stall hint: if nothing arrived for 30s, say so and point at Stop.
+    // The stream can wedge server-side (no terminator); the user should know
+    // that stopping keeps whatever is already on screen.
+    if (streamingActive && Date.now() - lastProgressAt > 30000) {
+      $("statusText").textContent = statusBase + " (still waiting — Stop keeps what's shown)";
+    } else {
+      $("statusText").textContent = statusBase;
+    }
   }, 100);
 }
 
 function updateStatus(message, chars) {
+  statusBase = message;
   $("statusText").textContent = message;
-  if ($("statusChars") && typeof chars === "number") $("statusChars").textContent = chars + " chars";
+  if ($("statusChars") && typeof chars === "number") {
+    $("statusChars").textContent = chars + " chars";
+    lastProgressAt = Date.now();
+  }
 }
 
 function clearStatus() {
@@ -456,6 +474,37 @@ async function streamSSE(url, payload, onEvent, signal) {
   if (buf.trim()) dispatch(buf);
 }
 
+function showWarning(text) {
+  if (!text) return;
+  $("warning").textContent = text;
+  $("warning").classList.remove("hidden");
+}
+
+function goalFromMarkdown(md, fallback) {
+  const m = String(md || "").match(/\*\*Goal:\*\*\s*(.+)/);
+  const line = ((m && m[1]) || fallback || "Partial plan").trim().split("\n")[0];
+  return smartTruncate(line, 220);
+}
+
+// Safety net: never let a run look wedged forever client-side. The server
+// enforces its own stall/deadline bounds, but if they ever fail (proxy
+// buffering, dropped SSE without close), auto-stop and keep the partial.
+function startWatchdog() {
+  clearTimeout(watchdogId);
+  autoStopped = false;
+  watchdogId = setTimeout(() => {
+    if (streamingActive && abortCtrl) {
+      autoStopped = true;
+      abortCtrl.abort();
+    }
+  }, 240000);
+}
+
+function clearWatchdog() {
+  clearTimeout(watchdogId);
+  watchdogId = null;
+}
+
 async function generate() {
   if (streamingActive) return;
   const idea = $("idea").value.trim();
@@ -464,6 +513,7 @@ async function generate() {
   abortCtrl = new AbortController();
   const signal = abortCtrl.signal;
   setBusy(true, "Generating…");
+  startWatchdog();
   showResult(true);
   $("resultSection").scrollIntoView({behavior: "smooth", block: "start"});
 
@@ -508,7 +558,10 @@ async function generate() {
         renderPreview(accumulated);
         const badge = $("sourceBadge");
         badge.classList.remove("hidden");
-        badge.textContent = ev.source === "llm" ? "✨ AI-generated" : "📦 Offline template (add API key for AI)";
+        badge.textContent = ev.source === "llm"
+          ? (ev.truncated ? "✨ AI-generated (partial — stream stalled)" : "✨ AI-generated")
+          : "📦 Offline template (add API key for AI)";
+        if (ev.warning) showWarning(ev.warning);
       }
       else if (ev.type === "error") throw new Error(ev.error);
     }, signal);
@@ -527,6 +580,18 @@ async function generate() {
         $("planMd").value = previous;
         renderPreview(previous);
         $("generatedTitle").textContent = generatedGoal || "Your plan";
+      } else if (accumulated.trim()) {
+        // Keep the partial output on screen with a real title/badge instead
+        // of leaving it stuck on "Drafting your plan…".
+        generatedGoal = goalFromMarkdown(accumulated, idea.split("\n")[0]);
+        $("generatedTitle").textContent = generatedGoal;
+        const badge = $("sourceBadge");
+        badge.classList.remove("hidden");
+        badge.textContent = "⏸ Partial (stopped) — kept what's shown";
+        persistDraft();
+        showWarning(autoStopped
+          ? "Stopped automatically after 4 min with no finish from the AI — kept the partial output. Regenerate to retry."
+          : "Stopped — kept the partial output shown above.");
       }
       setStatus("Stopped.");
       setTimeout(clearStatus, 1200);
@@ -536,6 +601,7 @@ async function generate() {
       alert("Generation failed: " + e.message);
     }
   } finally {
+    clearWatchdog();
     abortCtrl = null;
     setBusy(false);
     if ($("statusText").textContent !== "Stopped.") clearStatus();
@@ -551,6 +617,7 @@ async function refine() {
   abortCtrl = new AbortController();
   const signal = abortCtrl.signal;
   setBusy(true, "Refining…");
+  startWatchdog();
   setStatus("Refining plan — original stays until the revision streams in…");
   $("resultSection").classList.add("regenerating");
   let accumulated = "";
@@ -584,6 +651,8 @@ async function refine() {
         }
         $("refineInput").value = "";
         $("refineInput").placeholder = "Anything else to tweak?";
+        if (ev.warning) showWarning(ev.warning);
+        else if (ev.truncated) showWarning("The stream stalled — kept the partial revision shown above.");
       }
       else if (ev.type === "error") throw new Error(ev.error);
     }, signal);
@@ -600,9 +669,12 @@ async function refine() {
       if (!gotFirstDelta) {
         $("planMd").value = previous;
         renderPreview(previous);
+      } else if (autoStopped) {
+        showWarning("Stopped automatically after 4 min with no finish from the AI — kept the partial revision. Send your instruction again to retry.");
       }
       setStatus("Stopped.");
       setTimeout(clearStatus, 1200);
+      clearWatchdog();
       abortCtrl = null;
       setBusy(false);
       return;
@@ -611,6 +683,7 @@ async function refine() {
     renderPreview(previous);
     alert("Refine failed: " + e.message);
   } finally {
+    clearWatchdog();
     abortCtrl = null;
     setBusy(false);
     clearStatus();

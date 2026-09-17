@@ -219,8 +219,77 @@ def call_llm_markdown(messages: list, api_key: str, base_url: str, model: str, t
     return content.strip().strip("`").strip()
 
 
-def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model: str, timeout: int = 90):
-    """Yield text deltas from an OpenAI-compatible streaming chat completion."""
+# Streaming safety bounds. Some providers / relays never send [DONE] and never
+# close the connection (keep-alive pings, wedged gateways, missing terminator
+# after the last token) — the old code then streamed forever (seen at 293s+
+# with a complete-looking plan already on screen, since content had arrived
+# but the terminator never did). So the streamer enforces:
+# - terminal-frame detection (finish_reason / done flags, not just [DONE])
+# - an idle timeout (no content for a while -> raise, caller finishes partial)
+# - a hard wall-clock deadline + a max-chars cap against runaway generation
+STREAM_SOCKET_TIMEOUT = 15
+STREAM_IDLE_TIMEOUT = 45
+STREAM_HARD_DEADLINE = 170
+STREAM_MAX_CHARS = 20000
+
+
+class StreamStalled(TimeoutError):
+    """Raised when a streaming response stalls or exceeds its deadline."""
+
+
+def _extract_stream_delta(obj: dict) -> tuple:
+    """Return (text, is_done) from one parsed SSE data frame.
+
+    Handles provider variants: delta.content, message.content (some servers
+    emit non-stream shapes on a stream), text, plus terminal signals via
+    finish_reason or done flags (Ollama, vLLM, various gateways) — not just
+    the literal [DONE] sentinel.
+    """
+    if not isinstance(obj, dict):
+        return "", False
+    choices = obj.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        # No choices: Ollama-style frames carry content at the top level
+        # ({"message": {"content": ...}} or {"response": ...}); terminal only
+        # if the provider says done explicitly.
+        text = ""
+        msg = obj.get("message")
+        if isinstance(msg, dict):
+            text = msg.get("content") or ""
+        if not text:
+            text = obj.get("response") or ""
+        if not isinstance(text, str):
+            text = ""
+        return text, obj.get("done") is True
+    choice = choices[0] or {}
+    if not isinstance(choice, dict):
+        return "", False
+    text = ""
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        text = delta.get("content") or ""
+    if not text:
+        msg = choice.get("message")
+        if isinstance(msg, dict):
+            text = msg.get("content") or ""
+    if not text:
+        text = choice.get("text") or ""
+    if not isinstance(text, str):
+        text = ""
+    done = bool(choice.get("finish_reason")) or choice.get("done") is True or obj.get("done") is True
+    return text, done
+
+
+def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model: str, timeout: int = STREAM_SOCKET_TIMEOUT,
+                             idle_timeout: int = STREAM_IDLE_TIMEOUT, deadline: int = STREAM_HARD_DEADLINE,
+                             max_chars: int = STREAM_MAX_CHARS):
+    """Yield text deltas from an OpenAI-compatible streaming chat completion.
+
+    Raises StreamStalled instead of hanging forever when the provider stops
+    sending content but keeps the connection alive.
+    """
+    import time
+
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {"model": model, "messages": messages, "temperature": 0.7, "stream": True}
     req = urllib.request.Request(
@@ -233,13 +302,33 @@ def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    start = time.monotonic()
+    last_delta_at = start
+    # Wake up regularly so stall/deadline checks run even when the server
+    # trickles keep-alives slower than any single generous read timeout.
+    sock_timeout = max(1, min(timeout, STREAM_SOCKET_TIMEOUT))
+    with urllib.request.urlopen(req, timeout=sock_timeout) as resp:
         buf = b""
+        chars = 0
         while True:
-            # Small reads = lower time-to-first-token. read() returns up to
-            # n bytes as soon as any arrive, so 256 surfaces deltas faster
-            # than waiting to fill a 1-4KB buffer.
-            chunk = resp.read(256)
+            if time.monotonic() - start > deadline:
+                raise StreamStalled(f"stream exceeded {deadline}s deadline")
+            # Checked every loop turn — including turns that only yield SSE
+            # comments (: ping), blank lines, or content-less frames — so a
+            # steady drip of nothing-content can never hold the stream open.
+            if time.monotonic() - last_delta_at > idle_timeout:
+                raise StreamStalled(f"no content for {idle_timeout}s — stream stalled")
+            try:
+                # Small reads = lower time-to-first-token. read() returns up to
+                # n bytes as soon as any arrive, so 256 surfaces deltas faster
+                # than waiting to fill a 1-4KB buffer.
+                chunk = resp.read(256)
+            except TimeoutError:
+                # Silent socket (no bytes at all): only fatal when no *content*
+                # arrived recently — keep-alives alone must not extend a stall.
+                if time.monotonic() - last_delta_at > idle_timeout:
+                    raise StreamStalled(f"no content for {idle_timeout}s — stream stalled")
+                continue
             if not chunk:
                 break
             buf += chunk
@@ -247,7 +336,7 @@ def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model:
                 line, buf = buf.split(b"\n", 1)
                 line = line.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
-                    continue
+                    continue  # SSE comments (: ping), event: lines, blanks
                 data = line[5:].strip()
                 if data == "[DONE]":
                     return
@@ -255,12 +344,15 @@ def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model:
                     obj = json.loads(data)
                 except Exception:
                     continue
-                try:
-                    delta = obj["choices"][0]["delta"].get("content", "")
-                except Exception:
-                    delta = ""
-                if delta:
-                    yield delta
+                text, is_done = _extract_stream_delta(obj)
+                if text:
+                    chars += len(text)
+                    last_delta_at = time.monotonic()
+                    yield text
+                    if chars >= max_chars:
+                        return
+                if is_done:
+                    return
 
 
 def smart_truncate(text: str, limit: int = 220) -> str:
@@ -439,24 +531,47 @@ def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
         messages = messages_fn(data)
         yield sse({"type": "status", "message": "AI is drafting your plan — streaming…"})
         full = []
+        warning = None
+        truncated = False
         try:
             for delta in iter_llm_markdown_stream(messages, api_key, base_url, model):
                 full.append(delta)
                 yield sse({"type": "delta", "text": delta})
-        except Exception:
-            # Streaming not supported by this provider — fall back to one-shot call.
-            yield sse({"type": "status", "message": "Live stream unavailable — fetching full plan…"})
-            try:
-                full_text = call_llm_markdown(messages, api_key, base_url, model)
-            except Exception as e:
-                yield sse({"type": "error", "error": f"LLM call failed: {e}"})
-                return
-            yield sse({"type": "delta", "text": full_text})
-            full = [full_text]
+        except Exception as e:
+            # Stream broke mid-flight (stall, deadline, dropped connection).
+            # If content already arrived, finish with the partial plan instead
+            # of hanging or throwing it away — the UI marks it as partial.
+            if "".join(full).strip():
+                truncated = True
+                if isinstance(e, StreamStalled):
+                    warning = (f"{e} — kept what arrived so far. "
+                               "Regenerate to retry, or keep this partial plan.")
+                else:
+                    warning = ("Connection dropped mid-stream — kept what arrived so far. "
+                               "Regenerate to retry, or keep this partial plan.")
+                yield sse({"type": "status", "message": "Finishing with what arrived…"})
+            else:
+                # Nothing arrived — fall back to one-shot call.
+                yield sse({"type": "status", "message": "Live stream unavailable — fetching full plan…"})
+                try:
+                    full_text = call_llm_markdown(messages, api_key, base_url, model)
+                except Exception as e2:
+                    yield sse({"type": "error", "error": f"LLM call failed: {e2}"})
+                    return
+                yield sse({"type": "delta", "text": full_text})
+                full = [full_text]
         markdown = "".join(full).strip()
-        yield sse({"type": "done", "markdown": markdown,
-                   "goal": extract_goal_from_markdown(markdown, idea_val),
-                   "source": "llm"})
+        if not markdown:
+            yield sse({"type": "error", "error": "Empty response from AI."})
+            return
+        done_payload: dict = {"type": "done", "markdown": markdown,
+                        "goal": extract_goal_from_markdown(markdown, idea_val),
+                        "source": "llm"}
+        if warning:
+            done_payload["warning"] = warning
+        if truncated:
+            done_payload["truncated"] = True
+        yield sse(done_payload)
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
