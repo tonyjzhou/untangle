@@ -57,6 +57,7 @@ async function refreshList() {
 }
 
 async function loadPlan(id) {
+  if (abortCtrl) abortCtrl.abort();
   const res = await fetch(`/api/plans/${id}`);
   const p = await res.json();
   currentId = p.id;
@@ -71,6 +72,7 @@ async function loadPlan(id) {
 }
 
 function resetToDump() {
+  if (abortCtrl) abortCtrl.abort();
   currentId = null;
   generatedGoal = "";
   $("idea").value = "";
@@ -90,23 +92,41 @@ $("newBtn").onclick = resetToDump;
 
 let statusTimerId = null;
 let statusStartedAt = 0;
+let abortCtrl = null;
+let streamingActive = false;
 
 function setBusy(busy, label) {
-  for (const id of ["generateBtn", "regenerateBtn", "refineBtn", "saveBtn"]) {
+  // Only block (re)generation + refine. Keep Save / Delete / New / sidebar
+  // clickable so the screen never feels frozen. A Stop button aborts.
+  for (const id of ["generateBtn", "regenerateBtn", "refineBtn"]) {
     const el = $(id);
     if (el) el.disabled = busy;
   }
+  if ($("refineInput")) $("refineInput").disabled = busy;
+  streamingActive = busy;
   const btn = $("generateBtn");
   if (btn) btn.textContent = busy ? (label || "Generating…") : "✨ Generate concrete steps";
   const regen = $("regenerateBtn");
   if (regen) regen.textContent = busy ? (label || "Working…") : "↻ Regenerate";
+  const cancel = $("cancelBtn");
+  if (cancel) cancel.classList.toggle("hidden", !busy);
+  if ($("planMd")) $("planMd").readOnly = busy;
   if (busy) $("preview").classList.add("streaming");
-  else $("preview").classList.remove("streaming");
+  else {
+    $("preview").classList.remove("streaming");
+    $("resultSection").classList.remove("regenerating", "streaming-active");
+  }
+}
+
+function showSkeleton() {
+  $("preview").innerHTML =
+    '<div class="skeleton"><span style="width:60%"></span><span></span><span style="width:85%"></span><span style="width:70%"></span><span></span><span style="width:50%"></span></div>';
 }
 
 function setStatus(message) {
   $("status").classList.remove("hidden");
   $("statusText").textContent = message;
+  if ($("statusChars")) $("statusChars").textContent = "";
   statusStartedAt = Date.now();
   $("statusTimer").textContent = "0.0s";
   clearInterval(statusTimerId);
@@ -115,8 +135,9 @@ function setStatus(message) {
   }, 100);
 }
 
-function updateStatus(message) {
+function updateStatus(message, chars) {
   $("statusText").textContent = message;
+  if ($("statusChars") && typeof chars === "number") $("statusChars").textContent = chars + " chars";
 }
 
 function clearStatus() {
@@ -134,11 +155,12 @@ function llmPayload(extra) {
 }
 
 // POST an SSE endpoint and dispatch parsed `data:` events.
-async function streamSSE(url, payload, onEvent) {
+async function streamSSE(url, payload, onEvent, signal) {
   const res = await fetch(url, {
     method: "POST",
     headers: {"Content-Type": "application/json", "Accept": "text/event-stream"},
     body: JSON.stringify(payload),
+    signal,
   });
   const contentType = res.headers.get("content-type") || "";
   if (!contentType.includes("text/event-stream")) {
@@ -172,24 +194,48 @@ async function streamSSE(url, payload, onEvent) {
 }
 
 async function generate() {
+  if (streamingActive) return;
   const idea = $("idea").value.trim();
   if (idea.length < 5) { alert("Dump a bit more detail first."); return; }
   $("warning").classList.add("hidden");
+  abortCtrl = new AbortController();
+  const signal = abortCtrl.signal;
   setBusy(true, "Generating…");
-  setStatus("Starting…");
   showResult(true);
-  $("generatedTitle").textContent = "Drafting your plan…";
-  $("planMd").value = "";
-  renderPreview("");
-  $("resultSection").scrollIntoView({behavior: "smooth"});
+  $("resultSection").scrollIntoView({behavior: "smooth", block: "start"});
+
+  // Keep the old plan on screen until the new one actually arrives.
+  // Blank-screen + locked buttons is what felt "frozen".
+  const previous = $("planMd").value;
+  const isRegen = previous.trim().length > 0;
+  if (isRegen) {
+    setStatus("Regenerating — old plan stays until the new one streams in…");
+    $("resultSection").classList.add("regenerating");
+    $("generatedTitle").textContent = (generatedGoal || "Your plan") + " — regenerating…";
+  } else {
+    setStatus("Starting…");
+    $("generatedTitle").textContent = "Drafting your plan…";
+    $("planMd").value = "";
+    showSkeleton();
+  }
   let accumulated = "";
+  let gotFirstDelta = false;
+  const markStreaming = () => {
+    if (!gotFirstDelta) {
+      gotFirstDelta = true;
+      $("resultSection").classList.add("streaming-active");
+      if (isRegen) updateStatus("New plan streaming in…", 0);
+    }
+  };
   try {
     await streamSSE("/api/generate/stream", llmPayload({idea}), (ev) => {
-      if (ev.type === "status") updateStatus(ev.message);
+      if (ev.type === "status") updateStatus(ev.message, accumulated.length || undefined);
       else if (ev.type === "delta") {
+        markStreaming();
         accumulated += ev.text || "";
         $("planMd").value = accumulated;
         renderPreview(accumulated);
+        updateStatus(isRegen ? "New plan streaming in…" : "AI is drafting your plan — streaming…", accumulated.length);
       }
       else if (ev.type === "done") {
         accumulated = ev.markdown || accumulated;
@@ -202,38 +248,61 @@ async function generate() {
         badge.textContent = ev.source === "llm" ? "✨ AI-generated" : "📦 Offline template (add API key for AI)";
       }
       else if (ev.type === "error") throw new Error(ev.error);
-    });
+    }, signal);
     if (!accumulated.trim()) throw new Error("Empty response from AI.");
   } catch (e) {
-    $("generatedTitle").textContent = generatedGoal || "Generation failed";
-    alert("Generation failed: " + e.message);
+    if (e.name === "AbortError" || (abortCtrl && abortCtrl.signal.aborted)) {
+      // Restore whatever was on screen before the aborted run.
+      if (isRegen && !gotFirstDelta) {
+        $("planMd").value = previous;
+        renderPreview(previous);
+        $("generatedTitle").textContent = generatedGoal || "Your plan";
+      }
+      setStatus("Stopped.");
+      setTimeout(clearStatus, 1200);
+    } else {
+      if (!isRegen || !gotFirstDelta) $("generatedTitle").textContent = generatedGoal || "Generation failed";
+      else $("generatedTitle").textContent = generatedGoal || "Your plan";
+      alert("Generation failed: " + e.message);
+    }
   } finally {
+    abortCtrl = null;
     setBusy(false);
-    clearStatus();
+    if ($("statusText").textContent !== "Stopped.") clearStatus();
   }
 }
 
 async function refine() {
+  if (streamingActive) return;
   const instruction = $("refineInput").value.trim();
   if (instruction.length < 3) { alert("Tell the AI what to change first."); return; }
   if ($("planMd").value.trim().length < 10) { alert("Generate a plan first."); return; }
   $("warning").classList.add("hidden");
+  abortCtrl = new AbortController();
+  const signal = abortCtrl.signal;
   setBusy(true, "Refining…");
-  setStatus("Refining plan…");
+  setStatus("Refining plan — original stays until the revision streams in…");
+  $("resultSection").classList.add("regenerating");
   let accumulated = "";
+  let gotFirstDelta = false;
   const previous = $("planMd").value;
-  $("planMd").value = previous + "\n\n<!-- Refining: " + instruction.replace(/-->/g, "") + " -->";
   try {
     await streamSSE("/api/refine/stream", llmPayload({
       idea: $("idea").value,
       plan_markdown: previous,
       instruction,
     }), (ev) => {
-      if (ev.type === "status") updateStatus(ev.message);
+      if (ev.type === "status") updateStatus(ev.message, accumulated.length || undefined);
       else if (ev.type === "delta") {
+        if (!gotFirstDelta) {
+          gotFirstDelta = true;
+          accumulated = "";
+          $("resultSection").classList.add("streaming-active");
+        }
         accumulated += ev.text || "";
         $("planMd").value = accumulated;
         renderPreview(accumulated);
+        updateStatus("Revision streaming in…", accumulated.length);
       }
       else if (ev.type === "done") {
         accumulated = ev.markdown || accumulated;
@@ -247,13 +316,25 @@ async function refine() {
         $("refineInput").placeholder = "Anything else to tweak?";
       }
       else if (ev.type === "error") throw new Error(ev.error);
-    });
+    }, signal);
     if (!accumulated.trim()) throw new Error("Empty response from AI.");
   } catch (e) {
+    if (e.name === "AbortError" || (abortCtrl && abortCtrl.signal.aborted)) {
+      if (!gotFirstDelta) {
+        $("planMd").value = previous;
+        renderPreview(previous);
+      }
+      setStatus("Stopped.");
+      setTimeout(clearStatus, 1200);
+      abortCtrl = null;
+      setBusy(false);
+      return;
+    }
     $("planMd").value = previous;
     renderPreview(previous);
     alert("Refine failed: " + e.message);
   } finally {
+    abortCtrl = null;
     setBusy(false);
     clearStatus();
   }
@@ -262,6 +343,7 @@ async function refine() {
 $("generateBtn").onclick = generate;
 $("regenerateBtn").onclick = generate;
 $("refineBtn").onclick = refine;
+$("cancelBtn").onclick = () => { if (abortCtrl) abortCtrl.abort(); };
 $("refineInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); refine(); }
 });

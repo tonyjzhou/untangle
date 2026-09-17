@@ -235,7 +235,10 @@ def iter_llm_markdown_stream(messages: list, api_key: str, base_url: str, model:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         buf = b""
         while True:
-            chunk = resp.read(1024)
+            # Small reads = lower time-to-first-token. read() returns up to
+            # n bytes as soon as any arrive, so 256 surfaces deltas faster
+            # than waiting to fill a 1-4KB buffer.
+            chunk = resp.read(256)
             if not chunk:
                 break
             buf += chunk
@@ -442,7 +445,8 @@ def _stream_markdown_response(messages_fn, idea: str, chunk_delay: float = 0.0):
                    "source": "llm"})
 
     return Response(stream_with_context(gen()), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 @app.post("/api/generate/stream")
