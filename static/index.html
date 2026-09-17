@@ -59,11 +59,14 @@
         </div>
         <p class="hint">Refine keeps your checked boxes where possible. Needs an API key; offline mode can't rewrite.</p>
       </div>
-      <label class="section-label">Plan (editable Markdown, checkboxes persist):</label>
-      <div class="editor-grid">
-        <textarea id="planMd" placeholder="Your concrete steps will appear here..."></textarea>
-        <div id="preview" class="preview"></div>
+      <div class="plan-head">
+        <label class="section-label">Plan</label>
+        <div class="spacer"></div>
+        <button id="editToggleBtn" class="ghost">✏️ Edit Markdown</button>
       </div>
+      <div id="preview" class="preview" title="Double-click to edit Markdown"></div>
+      <textarea id="planMd" class="hidden" placeholder="Edit plan as Markdown..."></textarea>
+      <p class="hint">Click checkboxes to track progress. Click ✏️ Edit Markdown (or double-click the plan) to tweak the text.</p>
     </section>
   </main>
 </div>

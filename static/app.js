@@ -1,6 +1,8 @@
 const $ = (id) => document.getElementById(id);
 let currentId = null;
 let generatedGoal = "";
+let isEditing = false;
+let streamingActive = false;
 
 const store = {
   get baseUrl() { return localStorage.getItem("planner.baseUrl") || ""; },
@@ -25,17 +27,35 @@ function showResult(visible) {
 }
 
 function renderPreview(md) {
+  let checkIdx = 0;
   let html = md
     .replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/^### (.*)$/gm, "<h3>$1</h3>")
     .replace(/^## (.*)$/gm, "<h2>$1</h2>")
     .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/^- \[ \] (.*)$/gm, '<li><input type="checkbox" disabled> $1</li>')
-    .replace(/^- \[x\] (.*)$/gm, '<li><input type="checkbox" checked disabled> $1</li>')
+    .replace(/^- \[ \] (.*)$/gm, (m, t) => `<li><input type="checkbox" data-check="${checkIdx++}"> ${t}</li>`)
+    .replace(/^- \[[xX]\] (.*)$/gm, (m, t) => `<li><input type="checkbox" checked data-check="${checkIdx++}"> ${t}</li>`)
     .replace(/^- (.*)$/gm, "<li>$1</li>");
   $("preview").innerHTML = html;
 }
+
+function setEditMode(on) {
+  isEditing = on;
+  $("preview").classList.toggle("hidden", on);
+  $("planMd").classList.toggle("hidden", !on);
+  const btn = $("editToggleBtn");
+  if (btn) {
+    btn.textContent = on ? "Done" : "✏️ Edit Markdown";
+    btn.disabled = streamingActive;
+  }
+  if (on) $("planMd").focus();
+}
+
+$("editToggleBtn").onclick = () => setEditMode(!isEditing);
+$("preview").addEventListener("dblclick", () => {
+  if (!streamingActive) setEditMode(true);
+});
 
 $("planMd").addEventListener("input", (e) => renderPreview(e.target.value));
 
@@ -66,6 +86,7 @@ async function loadPlan(id) {
   $("idea").value = p.raw_idea || "";
   $("planMd").value = p.plan_markdown || "";
   renderPreview(p.plan_markdown || "");
+  setEditMode(false);
   $("sourceBadge").classList.add("hidden");
   showResult(true);
   refreshList();
@@ -83,6 +104,7 @@ function resetToDump() {
   $("warning").classList.add("hidden");
   if ($("status")) $("status").classList.add("hidden");
   if ($("refineInput")) $("refineInput").value = "";
+  setEditMode(false);
   showResult(false);
   $("idea").focus();
   refreshList();
@@ -93,7 +115,6 @@ $("newBtn").onclick = resetToDump;
 let statusTimerId = null;
 let statusStartedAt = 0;
 let abortCtrl = null;
-let streamingActive = false;
 
 function setBusy(busy, label) {
   // Only block (re)generation + refine. Keep Save / Delete / New / sidebar
@@ -111,10 +132,17 @@ function setBusy(busy, label) {
   const cancel = $("cancelBtn");
   if (cancel) cancel.classList.toggle("hidden", !busy);
   if ($("planMd")) $("planMd").readOnly = busy;
-  if (busy) $("preview").classList.add("streaming");
+  const editBtn = $("editToggleBtn");
+  if (editBtn) editBtn.disabled = busy;
+  if (busy) {
+    // Streaming always shows the clean rendered plan, never raw Markdown.
+    if (isEditing) setEditMode(false);
+    $("preview").classList.add("streaming");
+  }
   else {
     $("preview").classList.remove("streaming");
     $("resultSection").classList.remove("regenerating", "streaming-active");
+    if (editBtn) editBtn.disabled = false;
   }
 }
 
@@ -373,20 +401,20 @@ $("deleteBtn").onclick = async () => {
   resetToDump();
 };
 
-// toggle checkboxes in the markdown editor by clicking preview
+// toggle checkboxes by clicking them in the clean rendered plan
 $("preview").addEventListener("click", (e) => {
   if (e.target.tagName !== "INPUT" || e.target.type !== "checkbox") return;
-  const items = [...$("preview").querySelectorAll("li")];
-  const idx = items.indexOf(e.target.closest("li"));
+  const targetIdx = parseInt(e.target.dataset.check, 10);
+  if (Number.isNaN(targetIdx)) return;
   const lines = $("planMd").value.split("\n");
-  let liCount = -1;
+  let seen = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (/^- \[[ x]\]/.test(lines[i])) {
-      liCount++;
-      if (liCount === idx) {
+    if (/^- \[[ xX]\]/.test(lines[i])) {
+      seen++;
+      if (seen === targetIdx) {
         lines[i] = lines[i].includes("- [ ]")
           ? lines[i].replace("- [ ]", "- [x]")
-          : lines[i].replace("- [x]", "- [ ]");
+          : lines[i].replace(/- \[[xX]\]/, "- [ ]");
         break;
       }
     }
@@ -396,5 +424,6 @@ $("preview").addEventListener("click", (e) => {
 });
 
 showResult(false);
+setEditMode(false);
 refreshList();
 $("idea").focus();
